@@ -53,9 +53,11 @@ def _verify_model_download() -> None:
         )
 
     # Check for model weights
-    has_weights = any(
-        (LOCAL_MODEL_DIR / f).exists() 
-        for f in ["model.safetensors", "pytorch_model.bin", "model-00001-of-00002.safetensors"]
+    # Check for model weights, including sharded safetensors files
+    has_weights = (
+        (LOCAL_MODEL_DIR / "model.safetensors").exists()
+        or (LOCAL_MODEL_DIR / "pytorch_model.bin").exists()
+        or any(LOCAL_MODEL_DIR.glob("model-*.safetensors"))
     )
     if not has_weights:
         raise RuntimeError(
