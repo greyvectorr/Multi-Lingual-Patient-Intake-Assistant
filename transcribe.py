@@ -187,11 +187,6 @@ def transcribe_audio(audio_path: str, language: str, is_code_switched: bool = Fa
     if not audio_path or not os.path.isfile(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-    if language not in SUPPORTED_LANGUAGES:
-        raise ValueError(
-            f"Unsupported language: {language!r}. Expected one of: {', '.join(sorted(SUPPORTED_LANGUAGES))}"
-        )
-
     with tempfile.TemporaryDirectory(prefix="ncair_asr_") as tmpdir:
         try:
             pre_path = os.path.join(tmpdir, "preprocessed.wav")
@@ -208,36 +203,19 @@ def transcribe_audio(audio_path: str, language: str, is_code_switched: bool = Fa
             # Diagnostic test: bypass denoising and amplification
             final_path = pre_path
 
-            if is_code_switched or language == "English":
-                logger.info(
-                    "Using multilingual ASR model for language=%s, code_switched=%s",
-                    language,
-                    is_code_switched,
-                )
+            # Use one multilingual ASR model for every recording.
+            # Do not force a language, allowing multilingual recognition.
+            logger.info("Using unified multilingual ASR model")
             
-                asr = get_base_asr_pipeline()
+            asr = get_base_asr_pipeline()
             
-                generate_kwargs = {"task": "transcribe"}
+            result = asr(
+                final_path,
+                generate_kwargs={
+                    "task": "transcribe",
+                },
+            )
             
-                if language == "English" and not is_code_switched:
-                    generate_kwargs["language"] = "english"
-            
-                result = asr(
-                    final_path,
-                    generate_kwargs=generate_kwargs,
-                )
-            
-            else:
-                asr = get_asr_pipeline(language)
-            
-                result = asr(
-                    final_path,
-                    generate_kwargs={
-                        "language": language.lower(),
-                        "task": "transcribe",
-                    },
-                )
-              
             text = result.get("text", "").strip()
 
             if not text:
