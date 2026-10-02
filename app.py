@@ -484,10 +484,10 @@ def process_intake(
         return msg_or_pid, *render_dashboard(), gr.update(visible=False), "", "", "", "", "", "", gr.update(visible=False), ""
 
     if not audio_path:
-        return "✗ Please provide patient audio before processing.", *render_dashboard(), gr.update(visible=False), "", "", "", "", "", gr.update(visible=False), ""
+        return "✗ Please provide patient audio before processing.", *render_dashboard(), gr.update(visible=False), "", "", "", "", "", "", gr.update(visible=False), ""
 
     if language not in LANGUAGES:
-        return f"✗ Unsupported language: {language}.", *render_dashboard(), gr.update(visible=False), "", "", "", "", "", gr.update(visible=False), ""
+        return f"✗ Unsupported language: {language}.", *render_dashboard(), gr.update(visible=False), "", "", "", "", "", "", gr.update(visible=False), ""
 
     try:
         from transcribe import transcribe_audio
@@ -500,7 +500,7 @@ def process_intake(
         if not transcript or not transcript.strip():
             return (
                 "✗ Transcription returned empty. Please check audio quality and try again.",
-                *render_dashboard(), gr.update(visible=False), "", "", "", "", "", gr.update(visible=False), "",
+                *render_dashboard(), gr.update(visible=False), "", "", "", "", "", "", gr.update(visible=False), "",
             )
 
         language_context = detection_result.context_note if detection_result else ""
@@ -526,13 +526,13 @@ def process_intake(
         if "_error" in note:
             return (
                 f"✗ Clinical note generation failed: {note['_error']}",
-                *render_dashboard(), gr.update(visible=False), "", "", "", "", "", gr.update(visible=False), "",
+                *render_dashboard(), gr.update(visible=False), "", "", "", "", "", "", gr.update(visible=False), "",
             )
 
         if not note.get("chief_complaint"):
             return (
                 "✗ The AI returned an empty clinical note. Please try again with clearer audio.",
-                *render_dashboard(), gr.update(visible=False), "", "", "", "", "", gr.update(visible=False), "",
+                *render_dashboard(), gr.update(visible=False), "", "", "", "", "", "", gr.update(visible=False), "",
             )
 
         note_text = _note_to_text(note)
@@ -575,7 +575,7 @@ def process_intake(
         logger.error("Intake processing failed: %s", e)
         return (
             f"✗ Error during processing: {e}",
-            *render_dashboard(), gr.update(visible=False), "", "", "", "", "", gr.update(visible=False), "",
+            *render_dashboard(), gr.update(visible=False), "", "", "", "", "", "", gr.update(visible=False), "",
         )
 
     stat_html, activity_html = render_dashboard()
