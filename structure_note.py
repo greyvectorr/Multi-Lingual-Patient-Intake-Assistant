@@ -292,7 +292,13 @@ Use exactly this JSON structure:
   "duration": "...",
   "severity": "...",
   "history": "...",
-  "possible_recommendations": "..."
+  "possible_recommendations": "...",
+  "evidence": {{
+    "chief_complaint": "...",
+    "duration": "...",
+    "severity": "...",
+    "history": "..."
+  }}
 }}
 {evidence_field_instructions}
 {translated_reference_section}
