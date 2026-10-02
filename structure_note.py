@@ -223,13 +223,13 @@ IMPORTANT:
 
 The JSON MUST have exactly these top-level fields:
 
-{
+{{
   "chief_complaint": "...",
   "duration": "...",
   "severity": "...",
   "history": "...",
   "possible_recommendations": "..."
-}
+}}
 
 Definitions:
 - chief_complaint: The patient's main symptom or concern.
