@@ -36,7 +36,6 @@ MODEL_MAP: Final = {
     "Hausa": "NCAIR1/Hausa-ASR",
     "Igbo": "NCAIR1/Igbo-ASR",
     "Yoruba": "NCAIR1/Yoruba-ASR",
-    "English": "NCAIR1/NigerianAccentedEnglish"
 }
 
 # Fallback for code-switched audio: a general multilingual Whisper
@@ -51,6 +50,13 @@ MODEL_MAP: Final = {
 # languages — Hausa, Igbo, or Yoruba — was detected as primary.
 # Code-switching isn't specific to any one of them.
 BASE_MULTILINGUAL_MODEL: Final = "openai/whisper-small"
+
+SUPPORTED_LANGUAGES = {
+    "Hausa",
+    "Igbo",
+    "Yoruba",
+    "English",
+}
 
 # ── model cache ─────────────────────────────────────────────────────────────
 _asr_pipelines: dict[str, pipeline] = {}
@@ -181,9 +187,9 @@ def transcribe_audio(audio_path: str, language: str, is_code_switched: bool = Fa
     if not audio_path or not os.path.isfile(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-    if language not in MODEL_MAP:
+    if language not in SUPPORTED_LANGUAGES:
         raise ValueError(
-            f"Unsupported language: {language!r}. Expected one of: {', '.join(MODEL_MAP)}"
+            f"Unsupported language: {language!r}. Expected one of: {', '.join(sorted(SUPPORTED_LANGUAGES))}"
         )
 
     with tempfile.TemporaryDirectory(prefix="ncair_asr_") as tmpdir:
@@ -203,20 +209,34 @@ def transcribe_audio(audio_path: str, language: str, is_code_switched: bool = Fa
             sf.write(cleaned_path, cleaned, sr)
             _amplify_audio(cleaned_path, final_path)
 
-            if is_code_switched:
+            if is_code_switched or language == "English":
                 logger.info(
-                    "Code-switching flagged — using base multilingual model "
-                    "(%s) without a forced language, instead of the %s "
-                    "fine-tune",
-                    BASE_MULTILINGUAL_MODEL, language,
+                    "Using multilingual ASR model for language=%s, code_switched=%s",
+                    language,
+                    is_code_switched,
                 )
+            
                 asr = get_base_asr_pipeline()
-                result = asr(final_path, generate_kwargs={"task": "transcribe"})
-            else:
-                asr = get_asr_pipeline(language)
+            
+                generate_kwargs = {"task": "transcribe"}
+            
+                if language == "English" and not is_code_switched:
+                    generate_kwargs["language"] = "english"
+            
                 result = asr(
                     final_path,
-                    generate_kwargs={"language": language.lower(), "task": "transcribe"},
+                    generate_kwargs=generate_kwargs,
+                )
+            
+            else:
+                asr = get_asr_pipeline(language)
+            
+                result = asr(
+                    final_path,
+                    generate_kwargs={
+                        "language": language.lower(),
+                        "task": "transcribe",
+                    },
                 )
               
             text = result.get("text", "").strip()
