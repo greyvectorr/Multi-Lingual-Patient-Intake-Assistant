@@ -481,7 +481,7 @@ def process_intake(
     """
     valid, msg_or_pid = _validate_patient_id(patient_id)
     if not valid:
-        return msg_or_pid, *render_dashboard(), gr.update(visible=False), "", "", "", "", "", gr.update(visible=False), ""
+        return msg_or_pid, *render_dashboard(), gr.update(visible=False), "", "", "", "", "", "", gr.update(visible=False), ""
 
     if not audio_path:
         return "✗ Please provide patient audio before processing.", *render_dashboard(), gr.update(visible=False), "", "", "", "", "", gr.update(visible=False), ""
