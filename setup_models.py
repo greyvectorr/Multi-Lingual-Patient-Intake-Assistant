@@ -32,7 +32,7 @@ ASR_MODELS = {
     "Hausa": "NCAIR1/Hausa-ASR",
     "Igbo": "NCAIR1/Igbo-ASR",
     "Yoruba": "NCAIR1/Yoruba-ASR",
-    "English": "NCAIR1/NigerianAccentedEnglish" # Added this to check if English will be displayed
+    "English": "openai/whisper-small", # Added this to check if English will be displayed
     # Added in Phase 3: the unforced multilingual fallback used when
     # code-switching is detected (see asr/transcribe.py, Option C). This is
     # a genuinely new dependency the original setup script never needed.
