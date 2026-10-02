@@ -47,7 +47,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger(__name__)
 
 # ── constants ───────────────────────────────────────────────────────────────
-LANGUAGES = ["English", "Yoruba", "Igbo", "Hausa"]
+LANGUAGES = ["Hausa", "Igbo", "Yoruba", "English"]
 
 RECOMMENDATIONS_DISCLAIMER = (
     "⚠️ These are AI-assisted considerations for the doctor to weigh — NOT "
