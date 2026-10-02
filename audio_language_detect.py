@@ -77,7 +77,6 @@ LANGUAGE_CONFIDENCE_ADJUSTMENT: Final[Dict[str, float]] = {
     "Hausa": 0.0,
     "Igbo": 0.0,
     "Yoruba": 0.0,
-    "English": 0.0,
 }
 
 # ============================================================
