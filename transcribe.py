@@ -205,9 +205,8 @@ def transcribe_audio(audio_path: str, language: str, is_code_switched: bool = Fa
                     "No audio detected — recording may have failed or mic was silent"
                 )
 
-            cleaned = _reduce_noise(audio, sr)
-            sf.write(cleaned_path, cleaned, sr)
-            _amplify_audio(cleaned_path, final_path)
+            # Diagnostic test: bypass denoising and amplification
+            final_path = pre_path
 
             if is_code_switched or language == "English":
                 logger.info(
