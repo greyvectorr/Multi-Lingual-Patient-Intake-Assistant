@@ -423,7 +423,16 @@ def structure_note(transcript: str, language_context: str = "", translated_trans
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             raw_output = generate_text(prompt, max_new_tokens=750, temperature=0.1)
+
+            print("\n========== RAW N-ATLaS OUTPUT ==========")
+            print(repr(raw_output[:2500] if raw_output else raw_output))
+            print("========================================\n")
+            
             structured = _parse_llm_output(raw_output)
+            
+            print("\n========== PARSED STRUCTURE ==========")
+            print(structured)
+            print("======================================\n")
 
             if "_error" in structured:
                 last_error = structured["_error"]
