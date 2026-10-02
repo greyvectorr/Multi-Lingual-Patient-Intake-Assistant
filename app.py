@@ -780,7 +780,6 @@ with gr.Blocks(css=CUSTOM_CSS, title="MediVoice — Multi-Lingual Patient Intake
                             choices=LANGUAGES,
                             value=None,
                             label="Language (auto-detected — confirm or override)",
-                            placeholder="Confirm the language",
                             interactive=True,
                         )
                 with gr.Group(elem_classes=["card"]):
