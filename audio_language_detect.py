@@ -515,7 +515,7 @@ def detect_audio_language(audio_path: str) -> dict[str, Any]:
 
     # 6. Return format app.py expects
     # NEVER return None for detected_language — always fall back to a valid language
-    top_language = lang_result.detected_language or "Hausa"
+    top_language = lang_result.detected_language or "English"
 
     return {
         "detected_language": top_language,
