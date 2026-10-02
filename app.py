@@ -777,8 +777,11 @@ with gr.Blocks(css=CUSTOM_CSS, title="MediVoice — Multi-Lingual Patient Intake
                     with gr.Row():
                         patient_id_input = gr.Textbox(label="Patient ID", placeholder="e.g. P001", max_lines=1)
                         language_input = gr.Dropdown(
-                            LANGUAGES, value=LANGUAGES[0],
+                            choices=LANGUAGES,
+                            value=None,
                             label="Language (auto-detected — confirm or override)",
+                            placeholder="Confirm the language",
+                            interactive=True,
                         )
                 with gr.Group(elem_classes=["card"]):
                     gr.HTML(f'<b style="color:{COLOR_TEXT_DARK};">Patient Audio</b>')
