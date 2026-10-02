@@ -105,7 +105,7 @@ def get_asr_pipeline(language: str) -> pipeline:
             model_id,
             torch_dtype=torch_dtype,
             low_cpu_mem_usage=True,
-            use_safetensors=True,
+            use_safetensors=False,
         )
         model.to(device)
 
