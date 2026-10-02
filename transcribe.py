@@ -140,7 +140,7 @@ def get_base_asr_pipeline() -> pipeline:
             BASE_MULTILINGUAL_MODEL,
             torch_dtype=torch_dtype,
             low_cpu_mem_usage=True,
-            use_safetensors=True,
+            use_safetensors=False,
         )
         model.to(device)
 
