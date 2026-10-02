@@ -170,17 +170,36 @@ def generate_text(
     temperature: float = 0.3,
 ) -> str:
     """
-    Generate text using the loaded N-ATLaS model.
+    Generate text using the loaded N-ATLaS model with its
+    native Llama chat template.
     NEVER returns an empty string — raises RuntimeError if empty.
     """
     model, tokenizer = get_model()
 
+    messages = [
+        {
+            "role": "user",
+            "content": prompt,
+        }
+    ]
+
+    # N-ATLaS is an instruction/chat-tuned Llama model.
+    # Use its native chat template so the model receives the prompt
+    # in the format it was trained to follow.
+    formatted_prompt = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+
     inputs = tokenizer(
-        prompt,
+        formatted_prompt,
         return_tensors="pt",
         truncation=True,
         max_length=N_CTX,
+        add_special_tokens=False,
     )
+
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
     with torch.no_grad():
@@ -195,13 +214,17 @@ def generate_text(
 
     input_len = inputs["input_ids"].shape[1]
     generated_tokens = outputs[0][input_len:]
-    text = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+    text = tokenizer.decode(
+        generated_tokens,
+        skip_special_tokens=True,
+    ).strip()
 
     if not text:
-        raise RuntimeError("LLM returned an empty response — possible generation failure.")
+        raise RuntimeError(
+            "LLM returned an empty response — possible generation failure."
+        )
 
     return text
-
 
 # ============================================================================
 # PROMPT
