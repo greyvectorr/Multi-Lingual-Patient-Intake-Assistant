@@ -230,21 +230,62 @@ def generate_text(
 # PROMPT
 # ============================================================================
 
-STRUCTURE_PROMPT = """You are a clinical note structuring assistant for multilingual patient intake.
+STRUCTURE_PROMPT = """You are a clinical note assistant specializing in multilingual healthcare.
 
 {language_context}
 
-Convert the patient's speech into a structured clinical note.
+Your task is to convert the patient's speech into a structured English clinical note.
 
 IMPORTANT:
-- Use ONLY information explicitly present in the patient's speech.
-- Do not invent symptoms, diagnoses, medications, history, severity, or other facts.
-- If something was not stated, write exactly: "Not mentioned by patient".
-- Fields 1-4 must contain only patient-reported information.
-- possible_recommendations may contain cautious considerations, but must not diagnose the patient or give treatment instructions.
-- Return ONLY the JSON object below. Do not return Markdown, explanations, commentary, or an "output" wrapper.
+Use the patient's speech as the primary source of truth.
 
-The JSON MUST have exactly these top-level fields:
+For the fields:
+- chief_complaint
+- duration
+- severity
+- history
+
+Record what the patient explicitly said, while allowing cautious and reasonable interpretation where appropriate.
+
+For example:
+- If the patient describes pain as "very bad", the severity may be interpreted as severe.
+- If the patient gives enough descriptive information to reasonably suggest a severity level, you may make a cautious inference.
+- Do not invent symptoms, events, medications, diagnoses, or medical history that are not supported by the patient's speech.
+- If there is genuinely insufficient information for a field, write "Not mentioned by patient".
+
+FIELDS:
+
+1. chief_complaint
+Describe the patient's main symptom or concern clearly and naturally.
+
+2. duration
+Describe when the symptom started and how long it has lasted, if this information is available.
+
+3. severity
+Describe the severity based on the patient's own description and, where reasonably justified, cautious interpretation of the description.
+Do not invent a severity level when there is no meaningful basis for one.
+
+4. history
+Describe other symptoms, frequency, previous episodes, medications, or relevant context mentioned by the patient.
+You may organize the information into clearer clinical language, but do not introduce unsupported facts.
+
+5. possible_recommendations
+Provide brief, conservative considerations based only on the information available.
+Do not diagnose.
+Do not invent symptoms.
+Do not give definitive medical instructions.
+If there is insufficient information, write:
+"No specific considerations suggested — insufficient detail."
+
+ABSOLUTE RULE:
+Do not hallucinate information that has no reasonable basis in the patient's speech.
+
+If a field was not mentioned and cannot reasonably be inferred, write:
+"Not mentioned by patient".
+
+Respond with ONLY valid JSON.
+
+Use exactly this JSON structure:
 
 {{
   "chief_complaint": "...",
@@ -253,18 +294,15 @@ The JSON MUST have exactly these top-level fields:
   "history": "...",
   "possible_recommendations": "..."
 }}
+{evidence_field_instructions}
+{translated_reference_section}
 
-Definitions:
-- chief_complaint: The patient's main symptom or concern.
-- duration: When the problem started and how long it has continued.
-- severity: Any description by the patient of how severe or serious it feels.
-- history: Other symptoms, previous episodes, medications tried, or relevant context explicitly mentioned by the patient.
-- possible_recommendations: Brief, cautious considerations for a clinician to evaluate. If there is insufficient information, write exactly: "No specific considerations suggested — insufficient detail."
+Now process this patient's speech:
 
-Patient speech:
-{transcript}
+Patient speech: {transcript}
 
-Return the JSON object now:"""
+Output JSON only:
+"""
 
 
 EVIDENCE_FIELD_INSTRUCTIONS = """
