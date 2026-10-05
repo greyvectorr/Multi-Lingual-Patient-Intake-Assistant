@@ -942,5 +942,5 @@ with gr.Blocks(css=CUSTOM_CSS, title="MediVoice — Multi-Lingual Patient Intake
 if __name__ == "__main__":
     # Keep the interface local by default. Do not expose patient intake data
     # through a public Gradio share URL during development or testing.
-    demo.launch(server_name="127.0.0.1", share=False)
+    demo.launch(server_name="127.0.0.1", share=True)
 
