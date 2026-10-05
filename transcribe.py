@@ -203,19 +203,44 @@ def transcribe_audio(audio_path: str, language: str, is_code_switched: bool = Fa
             # Diagnostic test: bypass denoising and amplification
             final_path = pre_path
 
-            # Use one multilingual ASR model for every recording.
-            # Do not force a language, allowing multilingual recognition.
-            logger.info("Using unified multilingual ASR model")
-            
-            asr = get_base_asr_pipeline()
-            
+            # Route the recording to the most appropriate ASR model.
+            #
+            # Code-switched audio uses the general multilingual Whisper model because
+            # forcing the decoder into one language could distort words spoken in
+            # another language.
+            #
+            # English also uses the general multilingual Whisper model because there
+            # is no English-specific NCAIR model in MODEL_MAP.
+            #
+            # Pure Hausa, Igbo, and Yoruba recordings use their respective NCAIR
+            # fine-tuned models for better language-specific recognition.
+            if is_code_switched or language == "English":
+                logger.info(
+                    "Using multilingual ASR model: %s (code_switched=%s, language=%s)",
+                    BASE_MULTILINGUAL_MODEL,
+                    is_code_switched,
+                    language,
+                )
+                asr = get_base_asr_pipeline()
+
+            else:
+                logger.info(
+                    "Using NCAIR language-specific ASR model for %s",
+                    language,
+                )
+                asr = get_asr_pipeline(language)
+
+            # Run the selected ASR model on the preprocessed audio.
+            # Do not force a language token here. The selected model
+            # determines the language handling strategy.
             result = asr(
                 final_path,
                 generate_kwargs={
                     "task": "transcribe",
                 },
             )
-            
+
+            # Extract the recognised text from the ASR result.
             text = result.get("text", "").strip()
 
             if not text:

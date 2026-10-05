@@ -25,20 +25,11 @@ from typing import Any
 
 import gradio as gr
 
-# ── pre-flight model check ──────────────────────────────────────────────────
-MODEL_DIR = Path("models/N-ATLaS")
-if not MODEL_DIR.exists():
-    raise RuntimeError(
-        f"N-ATLaS model not found at {MODEL_DIR}.\n"
-        f"Please run first:  python setup_models.py"
-    )
-
-# ── path setup ──────────────────────────────────────────────────────────────
-_BASE = os.path.dirname(os.path.abspath(__file__))
-for sub in ("nlp", "asr", "templates"):
-    p = os.path.join(_BASE, sub)
-    if p not in sys.path:
-        sys.path.insert(0, p)
+# ── local-first model configuration ─────────────────────────────────────────
+# Model loading is handled by the NLP backend (for example, structure_note.py).
+# Do not require the original Transformers N-ATLaS directory here: the app
+# should be able to start while the local GGUF backend is being configured.
+_BASE = Path(__file__).resolve().parent
 
 import clinical_note as db  # noqa: E402
 
@@ -49,10 +40,9 @@ logger = logging.getLogger(__name__)
 # ── constants ───────────────────────────────────────────────────────────────
 LANGUAGES = ["Hausa", "Igbo", "Yoruba", "English"]
 
-RECOMMENDATIONS_DISCLAIMER = (
-    "⚠️ These are AI-assisted considerations for the doctor to weigh — NOT "
-    "recommendations, instructions, or a diagnosis. They may be incomplete "
-    "or inaccurate. Clinical judgment should always take precedence."
+PATIENT_CONCERNS_HELP = (
+    "Questions, worries, or requests explicitly expressed by the patient. "
+    "This field captures the patient's expressed concerns, not clinical advice."
 )
 
 # ── theme ───────────────────────────────────────────────────────────────────
@@ -549,7 +539,7 @@ def process_intake(
             duration=note.get("duration", ""),
             severity=note.get("severity", ""),
             history=note.get("history", ""),
-            possible_recommendations=note.get("possible_recommendations", ""),
+            patient_concerns=note.get("patient_concerns", ""),
             language=language,
             keywords=keywords,
             transcript=transcript,
@@ -591,7 +581,7 @@ def process_intake(
 def load_review(choice_label: str | None) -> tuple:
     """
     Returns a 12-tuple: header, chief_complaint, duration, severity, history,
-    possible_recommendations, keywords, raw_transcript, transparency_html,
+    patient_concerns, keywords, raw_transcript, transparency_html,
     evidence_html, review_status_update, visit_id. All four branches below
     must stay the same length and order, or the Gradio outputs= wiring will
     silently misassign values to the wrong component.
@@ -656,7 +646,7 @@ def load_review(choice_label: str | None) -> tuple:
         visit["duration"] or "",
         visit["severity"] or "",
         visit["history"] or "",
-        visit["possible_recommendations"] or "",
+        visit["patient_concerns"] or "",
         format_keywords(visit["extracted_keywords"]),
         visit["raw_transcript"] or "",
         transparency_html,
@@ -672,14 +662,14 @@ def confirm_and_finalize(
     duration: str,
     severity: str,
     history: str,
-    recommendations: str,
+    patient_concerns: str,
 ) -> tuple[str, str, gr.update, gr.update, int | None]:
     if visit_id is None:
         return "✗ No visit selected.", *render_queue(), gr.update(visible=False), None
 
     try:
         db.update_visit_and_mark_reviewed(
-            visit_id, chief_complaint, duration, severity, history, recommendations
+            visit_id, chief_complaint, duration, severity, history, patient_concerns
         )
     except Exception as e:
         traceback.print_exc()
@@ -836,9 +826,9 @@ with gr.Blocks(css=CUSTOM_CSS, title="MediVoice — Multi-Lingual Patient Intake
                         duration_box = gr.Textbox(label="Duration", lines=2)
                         severity_box = gr.Textbox(label="Severity", lines=2)
                         history_box = gr.Textbox(label="Relevant History", lines=4)
-                    with gr.Tab("💡 AI-Assisted Considerations"):
-                        gr.HTML(f'<div class="disclaimer">{RECOMMENDATIONS_DISCLAIMER}</div>')
-                        recommendations_box = gr.Textbox(label="", lines=6)
+                    with gr.Tab("💬 Patient Concerns"):
+                        gr.HTML(f'<div class="disclaimer">{PATIENT_CONCERNS_HELP}</div>')
+                        patient_concerns_box = gr.Textbox(label="Patient Concerns", lines=4)
                     with gr.Tab("🔍 Evidence"):
                         gr.Markdown("Where each field above was grounded in the translated transcript — verified as an exact match, not just an LLM claim.")
                         evidence_display_html = gr.HTML()
@@ -932,7 +922,7 @@ with gr.Blocks(css=CUSTOM_CSS, title="MediVoice — Multi-Lingual Patient Intake
         inputs=[queue_select],
         outputs=[
             review_header, chief_complaint_box, duration_box, severity_box,
-            history_box, recommendations_box, keywords_display, transcript_display,
+            history_box, patient_concerns_box, keywords_display, transcript_display,
             transparency_panel_html, evidence_display_html,
             review_status, visit_id_state,
         ],
@@ -940,7 +930,7 @@ with gr.Blocks(css=CUSTOM_CSS, title="MediVoice — Multi-Lingual Patient Intake
 
     finalize_btn.click(
         confirm_and_finalize,
-        inputs=[visit_id_state, chief_complaint_box, duration_box, severity_box, history_box, recommendations_box],
+        inputs=[visit_id_state, chief_complaint_box, duration_box, severity_box, history_box, patient_concerns_box],
         outputs=[review_status, queue_html, queue_select, finalize_trigger, visit_id_state],
         show_progress="minimal",
     )
@@ -950,4 +940,7 @@ with gr.Blocks(css=CUSTOM_CSS, title="MediVoice — Multi-Lingual Patient Intake
 
 
 if __name__ == "__main__":
-    demo.launch(share=True)
+    # Keep the interface local by default. Do not expose patient intake data
+    # through a public Gradio share URL during development or testing.
+    demo.launch(server_name="127.0.0.1", share=False)
+

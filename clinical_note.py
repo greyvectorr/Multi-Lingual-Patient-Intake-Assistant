@@ -69,7 +69,7 @@ def init_db() -> None:
                 duration TEXT,
                 severity TEXT,
                 history TEXT,
-                possible_recommendations TEXT,
+                patient_concerns TEXT,
                 language TEXT,
                 extracted_keywords TEXT,
                 raw_transcript TEXT,
@@ -92,9 +92,9 @@ def init_db() -> None:
 
 
 def _migrate_schema() -> None:
-    """Add any missing columns to existing tables."""
+    """Add feature columns required by the current application schema."""
     REQUIRED_COLUMNS = {
-        "possible_recommendations": "TEXT",
+        "patient_concerns": "TEXT",
         "status": "TEXT DEFAULT 'pending_review'",
         "reviewed_at": "TIMESTAMP",
         # Literal English translation of raw_transcript — distinct from the
@@ -132,7 +132,7 @@ def save_patient_record(
     duration: str,
     severity: str,
     history: str,
-    possible_recommendations: str,
+    patient_concerns: str,
     language: str,
     keywords: dict,
     transcript: str,
@@ -158,13 +158,13 @@ def save_patient_record(
             conn.execute(
                 """INSERT INTO clinical_visits
                    (patient_id, chief_complaint, duration, severity, history,
-                    possible_recommendations, language, extracted_keywords,
+                    patient_concerns, language, extracted_keywords,
                     raw_transcript, translated_transcript, is_code_switched,
                     code_switch_languages, note_evidence, status)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     patient_id, chief_complaint, duration, severity, history,
-                    possible_recommendations, language, json.dumps(keywords),
+                    patient_concerns, language, json.dumps(keywords),
                     transcript, translated_transcript, int(is_code_switched),
                     json.dumps(code_switch_languages or []),
                     json.dumps(evidence or {}), STATUS_PENDING,
@@ -184,18 +184,18 @@ def update_visit_and_mark_reviewed(
     duration: str,
     severity: str,
     history: str,
-    possible_recommendations: str,
+    patient_concerns: str,
 ) -> None:
     """Doctor-side save: applies edits and marks visit as reviewed."""
     with _get_connection() as conn:
         conn.execute(
             """UPDATE clinical_visits
                SET chief_complaint = ?, duration = ?, severity = ?, history = ?,
-                   possible_recommendations = ?, status = ?, reviewed_at = ?
+                   patient_concerns = ?, status = ?, reviewed_at = ?
                WHERE visit_id = ?""",
             (
                 chief_complaint, duration, severity, history,
-                possible_recommendations, STATUS_REVIEWED,
+                patient_concerns, STATUS_REVIEWED,
                 datetime.now().isoformat(), visit_id,
             ),
         )
@@ -207,7 +207,7 @@ def get_patient_history(patient_id: str) -> list[sqlite3.Row]:
     with _get_connection() as conn:
         cursor = conn.execute(
             """SELECT visit_id, chief_complaint, duration, severity, history,
-                      possible_recommendations, language, status, created_at
+                      patient_concerns, language, status, created_at
                FROM clinical_visits
                WHERE patient_id = ?
                ORDER BY created_at DESC, visit_id DESC""",
@@ -234,7 +234,7 @@ def get_visit_by_id(visit_id: int) -> sqlite3.Row | None:
     with _get_connection() as conn:
         cursor = conn.execute(
             """SELECT visit_id, patient_id, chief_complaint, duration, severity,
-                      history, possible_recommendations, language,
+                      history, patient_concerns, language,
                       extracted_keywords, raw_transcript, translated_transcript,
                       is_code_switched, code_switch_languages, note_evidence,
                       status, created_at, reviewed_at
@@ -272,7 +272,7 @@ def export_all_records_to_csv(output_path: str = "patient_records_export.csv") -
     with _get_connection() as conn:
         cursor = conn.execute("""
             SELECT visit_id, patient_id, chief_complaint, duration, severity,
-                   history, possible_recommendations, language,
+                   history, patient_concerns, language,
                    extracted_keywords, raw_transcript, translated_transcript,
                    is_code_switched, code_switch_languages, note_evidence,
                    status, created_at, reviewed_at
@@ -299,7 +299,7 @@ def export_single_visit_to_csv(visit_id: int, output_path: str | None = None) ->
 
     column_names = [
         "visit_id", "patient_id", "chief_complaint", "duration", "severity",
-        "history", "possible_recommendations", "language",
+        "history", "patient_concerns", "language",
         "extracted_keywords", "raw_transcript", "translated_transcript",
         "is_code_switched", "code_switch_languages", "note_evidence",
         "status", "created_at",
@@ -314,3 +314,4 @@ def export_single_visit_to_csv(visit_id: int, output_path: str | None = None) ->
         writer.writerow(tuple(row))
 
     return output_path
+

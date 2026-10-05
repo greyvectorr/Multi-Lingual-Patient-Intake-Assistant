@@ -1,14 +1,13 @@
 """
-LLM Structuring Stage — converts raw patient transcripts into structured
-English clinical notes using N-ATLaS LLM.
+LLM Structuring Stage
+---------------------
+Transforms patient transcripts into structured English clinical notes and
+provides a separate English translation.
 
-Loaded via Hugging Face transformers with 4-bit quantization.
-Run `python setup_models.py` BEFORE starting the app to download the model.
-
-Colab-specific fixes:
-  • low_cpu_mem_usage=True to prevent RAM blow-up during loading
-  • Graceful fallback to CPU if GPU OOM
-  • Clear error messages if the model can't load
+This edition uses a local GGUF model through llama-cpp-python. Model loading
+is lazy, so importing this module does not immediately consume several GB
+of RAM. The note prompts, parsing, validation, and evidence checks below
+remain based on the existing 2.0 implementation.
 """
 
 from __future__ import annotations
@@ -21,147 +20,84 @@ from pathlib import Path
 from threading import Lock
 from typing import Final
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from llama_cpp import Llama
 
 logger = logging.getLogger(__name__)
 
-LOCAL_MODEL_DIR: Final = Path("models/N-ATLaS")
-N_CTX: Final = 3072
+# Anchor the model path to this file so launching the app from another
+# working directory does not change where the model is expected to be.
+PROJECT_ROOT: Final = Path(__file__).resolve().parent
+LOCAL_MODEL_PATH: Final = PROJECT_ROOT / "models" / "gguf" / "AMINI-q4_k_m.gguf"
+
+# Conservative CPU settings for the current two-core, 16 GB RAM machine.
+# The context window includes prompt tokens and generated tokens together.
+N_CTX: Final = 2048
+N_THREADS: Final = 2
+N_BATCH: Final = 256
 MAX_RETRIES: Final = 2
 
-# ── model singleton ─────────────────────────────────────────────────────────
-_model: AutoModelForCausalLM | None = None
-_tokenizer: AutoTokenizer | None = None
+# Keep one shared model in memory rather than loading a new copy for each
+# translation or note request. The lock protects first-time loading.
+_model: Llama | None = None
 _model_lock = Lock()
 
 
-def _verify_model_download() -> None:
-    """Check that the model was fully downloaded."""
-    if not LOCAL_MODEL_DIR.exists():
+def _verify_model_file() -> None:
+    """Check that the expected GGUF file exists and is not obviously empty."""
+    if not LOCAL_MODEL_PATH.is_file():
         raise RuntimeError(
-            f"Model directory not found: {LOCAL_MODEL_DIR}\n"
-            f"Please run: python setup_models.py"
+            f"GGUF model file not found: {LOCAL_MODEL_PATH}\n"
+            "Place AMINI-q4_k_m.gguf in the project's models/gguf directory."
         )
 
-    required_files = ["config.json", "tokenizer.json"]
-    missing = [f for f in required_files if not (LOCAL_MODEL_DIR / f).exists()]
-    if missing:
+    # This is a basic size sanity check, not a checksum or full integrity test.
+    if LOCAL_MODEL_PATH.stat().st_size < 100_000_000:
         raise RuntimeError(
-            f"Model download appears incomplete. Missing: {missing}\n"
-            f"Please re-run: python setup_models.py"
-        )
-
-    # Check for model weights
-    # Check for model weights, including sharded safetensors files
-    has_weights = (
-        (LOCAL_MODEL_DIR / "model.safetensors").exists()
-        or (LOCAL_MODEL_DIR / "pytorch_model.bin").exists()
-        or any(LOCAL_MODEL_DIR.glob("model-*.safetensors"))
-    )
-    if not has_weights:
-        raise RuntimeError(
-            f"No model weights found in {LOCAL_MODEL_DIR}\n"
-            f"Please re-run: python setup_models.py"
+            f"GGUF model file appears incomplete: {LOCAL_MODEL_PATH}"
         )
 
 
 def _load_model() -> None:
-    """Lazy-load the transformers model on first use."""
-    global _model, _tokenizer
-    if _model is not None and _tokenizer is not None:
+    """Load the GGUF model once, when text generation is first requested."""
+    global _model
+
+    if _model is not None:
         return
 
     with _model_lock:
-        if _model is not None and _tokenizer is not None:
+        # Check again after acquiring the lock in case another thread loaded it.
+        if _model is not None:
             return
 
-        _verify_model_download()
+        _verify_model_file()
+        logger.info("Loading local GGUF model from %s ...", LOCAL_MODEL_PATH)
 
-        logger.info("Loading N-ATLaS tokenizer from %s ...", LOCAL_MODEL_DIR)
-        _tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_DIR, trust_remote_code=True)
-        if _tokenizer.pad_token is None:
-            _tokenizer.pad_token = _tokenizer.eos_token
-
-        logger.info("Loading N-ATLaS model... This may take 2–5 minutes on first load.")
-
-        # Try GPU first, fall back to CPU if OOM
-        load_errors = []
-
-        if torch.cuda.is_available():
-            try:
-                logger.info("Attempting GPU load with 4-bit quantization...")
-                bnb_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.float16,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4",
-                )
-                _model = AutoModelForCausalLM.from_pretrained(
-                    LOCAL_MODEL_DIR,
-                    quantization_config=bnb_config,
-                    device_map="auto",
-                    trust_remote_code=True,
-                    low_cpu_mem_usage=True,
-                    torch_dtype=torch.float16,
-                )
-                logger.info("✓ N-ATLaS loaded on GPU with 4-bit quantization.")
-                return
-            except Exception as e:
-                load_errors.append(f"GPU 4-bit failed: {e}")
-                logger.warning("GPU 4-bit load failed: %s", e)
-
-                # Clear GPU cache before retry
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-                try:
-                    logger.info("Retrying GPU with 8-bit quantization...")
-                    bnb_config_8bit = BitsAndBytesConfig(load_in_8bit=True)
-                    _model = AutoModelForCausalLM.from_pretrained(
-                        LOCAL_MODEL_DIR,
-                        quantization_config=bnb_config_8bit,
-                        device_map="auto",
-                        trust_remote_code=True,
-                        low_cpu_mem_usage=True,
-                    )
-                    logger.info("✓ N-ATLaS loaded on GPU with 8-bit quantization.")
-                    return
-                except Exception as e2:
-                    load_errors.append(f"GPU 8-bit failed: {e2}")
-                    logger.warning("GPU 8-bit load failed: %s", e2)
-                    torch.cuda.empty_cache()
-
-        # Fallback to CPU
         try:
-            logger.warning("Falling back to CPU load (slower but more stable)...")
-            _model = AutoModelForCausalLM.from_pretrained(
-                LOCAL_MODEL_DIR,
-                device_map="cpu",
-                torch_dtype=torch.float32,
-                trust_remote_code=True,
-                low_cpu_mem_usage=True,
+            _model = Llama(
+                model_path=str(LOCAL_MODEL_PATH),
+                n_ctx=N_CTX,
+                n_threads=N_THREADS,
+                n_batch=N_BATCH,
+                n_gpu_layers=0,  # Explicit CPU inference; no CUDA GPU is available.
+                verbose=False,
             )
-            logger.info("✓ N-ATLaS loaded on CPU.")
-        except Exception as e:
-            load_errors.append(f"CPU failed: {e}")
-            logger.error("All model loading attempts failed:")
-            for err in load_errors:
-                logger.error("  - %s", err)
+        except Exception as exc:
+            _model = None
+            logger.exception("Unable to load the local GGUF model.")
             raise RuntimeError(
-                f"Failed to load N-ATLaS model. Tried GPU (4-bit, 8-bit) and CPU.\n"
-                f"Last error: {e}\n"
-                f"If on Colab free tier, the model may be too large. "
-                f"Consider using a smaller model or upgrading to Colab Pro."
-            )
+                "Could not load the GGUF model. Check the file, available RAM, "
+                "and the llama-cpp-python installation."
+            ) from exc
+
+        logger.info("Local GGUF model loaded successfully.")
 
 
-def get_model() -> tuple[AutoModelForCausalLM, AutoTokenizer]:
-    """Return the shared (model, tokenizer) tuple."""
+def get_model() -> Llama:
+    """Return the shared model instance, loading it if necessary."""
     _load_model()
-    if _model is None or _tokenizer is None:
-        raise RuntimeError("Failed to load N-ATLaS model")
-    return _model, _tokenizer
+    if _model is None:
+        raise RuntimeError("The local GGUF model could not be loaded.")
+    return _model
 
 
 def generate_text(
@@ -170,61 +106,42 @@ def generate_text(
     temperature: float = 0.3,
 ) -> str:
     """
-    Generate text using the loaded N-ATLaS model with its
-    native Llama chat template.
-    NEVER returns an empty string — raises RuntimeError if empty.
+    Generate text through the model's chat-completion interface.
+
+    This preserves the original generate_text(prompt, ...) contract, allowing
+    the existing translation and note functions to continue calling it.
+    A repetition penalty is included to discourage repeated phrases.
     """
-    model, tokenizer = get_model()
+    if not prompt or not prompt.strip():
+        raise ValueError("Cannot generate text from an empty prompt.")
 
-    messages = [
-        {
-            "role": "user",
-            "content": prompt,
-        }
-    ]
+    model = get_model()
+    messages = [{"role": "user", "content": prompt.strip()}]
 
-    # N-ATLaS is an instruction/chat-tuned Llama model.
-    # Use its native chat template so the model receives the prompt
-    # in the format it was trained to follow.
-    formatted_prompt = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        tokenize=False,
-    )
-
-    inputs = tokenizer(
-        formatted_prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=N_CTX,
-        add_special_tokens=False,
-    )
-
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
-
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
+    try:
+        result = model.create_chat_completion(
+            messages=messages,
+            max_tokens=max_new_tokens,
             temperature=temperature,
             top_p=0.9,
-            do_sample=True,
-            pad_token_id=tokenizer.pad_token_id,
+            repeat_penalty=1.15,
         )
+    except Exception as exc:
+        logger.exception("Local GGUF text generation failed.")
+        raise RuntimeError("The local model failed during text generation.") from exc
 
-    input_len = inputs["input_ids"].shape[1]
-    generated_tokens = outputs[0][input_len:]
-    text = tokenizer.decode(
-        generated_tokens,
-        skip_special_tokens=True,
-    ).strip()
+    # Extract the assistant's response from the standard chat-completion shape.
+    choices = result.get("choices", [])
+    text = ""
+    if choices:
+        message = choices[0].get("message", {})
+        text = (message.get("content") or "").strip()
 
     if not text:
-        raise RuntimeError(
-            "LLM returned an empty response — possible generation failure."
-        )
+        raise RuntimeError("The local model returned an empty response.")
 
     return text
+
 
 # ============================================================================
 # PROMPT
@@ -269,16 +186,15 @@ Do not invent a severity level when there is no meaningful basis for one.
 Describe other symptoms, frequency, previous episodes, medications, or relevant context mentioned by the patient.
 You may organize the information into clearer clinical language, but do not introduce unsupported facts.
 
-5. possible_recommendations
-Provide brief, conservative considerations based only on the information available.
-Do not diagnose.
-Do not invent symptoms.
-Do not give definitive medical instructions.
-If there is insufficient information, write:
-"No specific considerations suggested — insufficient detail."
+5. patient_concerns:
+- Capture questions, worries, or requests explicitly expressed by the patient.
+- Do not repeat symptoms or medical history here.
+- Do not generate medical advice, diagnoses, or treatment recommendations.
+- If the patient expresses no concerns, use "Not mentioned by patient".
 
 ABSOLUTE RULE:
-Do not hallucinate information that has no reasonable basis in the patient's speech.
+Do not hallucinate information that has no reasonable basis
+in the patient's speech.
 
 If a field was not mentioned and cannot reasonably be inferred, write:
 "Not mentioned by patient".
@@ -292,12 +208,13 @@ Use exactly this JSON structure:
   "duration": "...",
   "severity": "...",
   "history": "...",
-  "possible_recommendations": "...",
+  "patient_concerns": "...",
   "evidence": {{
     "chief_complaint": "...",
     "duration": "...",
     "severity": "...",
-    "history": "..."
+    "history": "...",
+    "patient_concerns": "..."
   }}
 }}
 {evidence_field_instructions}
@@ -312,8 +229,11 @@ Output JSON only:
 
 
 EVIDENCE_FIELD_INSTRUCTIONS = """
-   FIELD 6 — EVIDENCE (grounding trail for fields 1-4, do NOT skip this):
-   - evidence: A JSON object with exactly four keys — chief_complaint, duration, severity, history. For each key, copy a short EXACT phrase (a few words, not a full sentence) directly from the "Patient's English-translated speech" text below that supports that field. Your quotes MUST be exact substrings of that text — do not paraphrase or invent wording. If a field's value is "Not mentioned by patient", set its evidence for that key to "" (empty string)."""
+   FIELD 6 — EVIDENCE (grounding trail for fields 1-5, do NOT skip this):
+   - evidence: A JSON object with exactly five keys — chief_complaint, duration, severity, history, patient_concerns.
+   - For each key, copy a short EXACT phrase directly from the translated speech that supports that field. Quotes must be exact substrings, not paraphrases.
+   - For patient_concerns, quote only an explicit patient question, worry, or request. Do not treat a symptom description alone as a concern.
+   - If a field is "Not mentioned by patient", its evidence must be "" (empty string)."""
 
 TRANSLATED_REFERENCE_TEMPLATE = """
 Patient's English-translated speech (quote evidence from this exact text): {translated_transcript}
@@ -324,7 +244,8 @@ EXAMPLE_EVIDENCE_FIELD = ''',
     "chief_complaint": "stomach has been hurting",
     "duration": "since yesterday",
     "severity": "very bad",
-    "history": ""
+    "history": "",
+    "patient_concerns": ""
   }'''
 
 
@@ -371,20 +292,22 @@ def _extract_json_from_text(text: str) -> str | None:
 
 
 def _validate_structure(data: dict) -> dict:
-    required = ["chief_complaint", "duration", "severity", "history"]
+    required = [
+        "chief_complaint", "duration", "severity", "history", "patient_concerns"
+    ]
+
     for field in required:
         if field not in data or not data[field]:
             data[field] = "Not mentioned by patient"
-    if "possible_recommendations" not in data or not data["possible_recommendations"]:
-        data["possible_recommendations"] = "No specific considerations suggested — insufficient detail."
 
-    # Normalize evidence shape regardless of what (if anything) the model
-    # returned — downstream code should always find a dict with these four
-    # keys, never a missing key or the wrong type.
     evidence = data.get("evidence")
     if not isinstance(evidence, dict):
         evidence = {}
-    data["evidence"] = {field: str(evidence.get(field) or "") for field in required}
+
+    data["evidence"] = {
+        field: str(evidence.get(field) or "") for field in required
+    }
+
     return data
 
 
@@ -436,7 +359,7 @@ def _error_result(msg: str, raw: str = "") -> dict:
         "duration": "",
         "severity": "",
         "history": "",
-        "possible_recommendations": "",
+        "patient_concerns": "",
         "evidence": {},
         "_error": msg,
         "_raw": raw,
@@ -485,17 +408,15 @@ def structure_note(transcript: str, language_context: str = "", translated_trans
     last_error = ""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            raw_output = generate_text(prompt, max_new_tokens=750, temperature=0.1)
+            # Generate the model response and parse it into a structured dictionary.
+            # Avoid printing raw clinical text or parsed patient information to the console.
+            raw_output = generate_text(
+                prompt,
+                max_new_tokens=750,
+                temperature=0.1,
+            )
 
-            print("\n========== RAW N-ATLaS OUTPUT ==========")
-            print(repr(raw_output[:2500] if raw_output else raw_output))
-            print("========================================\n")
-            
             structured = _parse_llm_output(raw_output)
-            
-            print("\n========== PARSED STRUCTURE ==========")
-            print(structured)
-            print("======================================\n")
 
             if "_error" in structured:
                 last_error = structured["_error"]
@@ -510,7 +431,7 @@ def structure_note(transcript: str, language_context: str = "", translated_trans
                 structured.get("evidence", {}),
                 translated_transcript if has_valid_translation else "",
             )
-
+            
             logger.info("Note structuring complete (attempt %d)", attempt)
             return structured
 
