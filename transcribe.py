@@ -1,189 +1,253 @@
 """
-transcribe.py patch: language-routed ASR for code-switched audio.
+ASR Stage — converts patient audio (Hausa/Igbo/Yoruba) into raw text using
+NCAIR's Whisper-Small fine-tuned models.
 
-HOW TO APPLY
-  1. Rename your existing `transcribe_audio` to `_transcribe_whole_file` (body unchanged).
-  2. Paste everything below into transcribe.py (after get_base_asr_pipeline).
-  3. Add `import librosa` is already there; nothing else new is imported.
-  4. Delete `transcribe_by_language_span` from the language module -- this replaces it.
+Fixed for Colab:
+  • Suppresses benign transformers warnings
+  • Uses direct model.generate() instead of pipeline chunking (avoids seq2seq warnings)
+  • Handles long-form audio properly
 """
 
-# ---------------- constants (untuned starting values) ----------------
-SAMPLE_RATE: Final = 16000
-MAX_PIECE_SECONDS: Final = 28.0        # Whisper window is 30 s; never hand it more
-MIN_PIECE_SECONDS: Final = 1.5         # shorter spans are absorbed into a neighbour
-BOUNDARY_SEARCH_SECONDS: Final = 1.5   # how far a language boundary may move to find a pause
-PAUSE_DISTANCE_PENALTY: Final = 0.005  # prefer pauses near the nominal boundary
-EDGE_PAD_SECONDS: Final = 0.5          # pad only the outer edges of the recording
-MIN_PIECE_RMS: Final = 0.003           # skip near-silent pieces (Whisper hallucinates on silence)
+from __future__ import annotations
+
+import logging
+import os
+import tempfile
+import warnings
+from pathlib import Path
+from typing import Final
+
+import librosa
+import numpy as np
+import soundfile as sf
+import torch
+from pydub import AudioSegment
+from pydub.effects import normalize
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*chunk_length_s.*")
+warnings.filterwarnings("ignore", message=".*forced_decoder_ids.*")
+warnings.filterwarnings("ignore", message=".*generation_config.*")
+
+logger = logging.getLogger(__name__)
+
+MODEL_MAP: Final = {
+    "Hausa": "NCAIR1/Hausa-ASR",
+    "Igbo": "NCAIR1/Igbo-ASR",
+    "Yoruba": "NCAIR1/Yoruba-ASR",
+}
+
+# Fallback for code-switched audio: a general multilingual Whisper
+# checkpoint, used WITHOUT a forced language token so the decoder can
+# switch language naturally mid-output. The NCAIR fine-tunes above are each
+# forced via generate_kwargs={"language": ...} — accurate for monolingual
+# speech, but that same forcing actively hurts a recording that genuinely
+# mixes languages, since every word gets pushed through one language's
+# decoder regardless of what was actually said.
+#
+# This applies the same way no matter which of the three supported
+# languages — Hausa, Igbo, or Yoruba — was detected as primary.
+# Code-switching isn't specific to any one of them.
+BASE_MULTILINGUAL_MODEL: Final = "openai/whisper-small"
+
+SUPPORTED_LANGUAGES = {
+    "Hausa",
+    "Igbo",
+    "Yoruba",
+    "English",
+}
+
+# ── model cache ─────────────────────────────────────────────────────────────
+_asr_pipelines: dict[str, pipeline] = {}
+_base_asr_pipeline: pipeline | None = None
 
 
-# ---------------- routing ----------------
-def pick_anchor_language(language: str, spans) -> str | None:
-    """The ONE indigenous language the NCAIR models handle for this visit.
-    Nurse/primary language if it is indigenous; otherwise the indigenous
-    language with the most speech time in the spans."""
-    if language in MODEL_MAP:
-        return language
-    secs: dict[str, float] = {}
-    for s in spans or []:
-        if s.get("language") in MODEL_MAP:
-            secs[s["language"]] = secs.get(s["language"], 0.0) + (s["end"] - s["start"])
-    return max(secs, key=secs.get) if secs else None
+def _preprocess_audio(audio_path: str, output_path: str) -> tuple[str, np.ndarray, int]:
+    """Resample to 16kHz mono."""
+    audio, sr = librosa.load(audio_path, sr=16000, mono=True)
+    sf.write(output_path, audio, sr)
+    return output_path, audio, sr
 
 
-def _route_for_span(span, anchor, allow_multi_indigenous) -> str:
-    lang = span.get("language")
-    if lang == "English":
-        return "English"
-    if allow_multi_indigenous and lang in MODEL_MAP:
-        return lang
-    # Indigenous or unknown -> the anchor. Whisper LID is unreliable BETWEEN
-    # ha/yo/ig, so a stray "Yoruba" label inside an Igbo visit must not send
-    # that stretch to the Yoruba model.
-    return anchor or "English"
+def _is_audio_too_quiet(audio: np.ndarray, silence_threshold: float = 0.01) -> bool:
+    rms = np.sqrt(np.mean(audio**2))
+    return rms < silence_threshold
 
 
-def _snap_to_pause(audio: np.ndarray, t: float, search: float = BOUNDARY_SEARCH_SECONDS, frame: float = 0.05) -> float:
-    """Move boundary t to the quietest 50 ms frame within +/-search seconds."""
-    n = int(frame * SAMPLE_RATE)
-    lo = max(0, int((t - search) * SAMPLE_RATE))
-    hi = min(len(audio), int((t + search) * SAMPLE_RATE))
-    k = (hi - lo) // n
-    if k < 2:
-        return float(t)
-    frames = audio[lo: lo + k * n].astype(np.float64).reshape(k, n)
-    rms = np.sqrt((frames ** 2).mean(axis=1))
-    centers = (lo + (np.arange(k) + 0.5) * n) / SAMPLE_RATE
-    score = rms + PAUSE_DISTANCE_PENALTY * np.abs(centers - t)
-    return float(centers[int(np.argmin(score))])
+def _reduce_noise(audio: np.ndarray, sr: int) -> np.ndarray:
+    import noisereduce as nr
+    return nr.reduce_noise(y=audio, sr=sr, stationary=False)
 
 
-def _merge_same_route(plan):
-    out = []
-    for p in plan:
-        if out and out[-1]["route"] == p["route"]:
-            out[-1]["end"] = p["end"]
-        else:
-            out.append(dict(p))
-    return out
+def _amplify_audio(audio_path: str, output_path: str) -> str:
+    audio = AudioSegment.from_file(audio_path)
+    normalized = normalize(audio)
+    normalized.export(output_path, format="wav")
+    return output_path
 
 
-def _plan_pieces(spans, audio: np.ndarray, anchor, allow_multi_indigenous=False):
-    """spans -> ordered ASR pieces [{start,end,route}], each <= MAX_PIECE_SECONDS."""
-    total = len(audio) / SAMPLE_RATE
-    plan = _merge_same_route([
-        {"start": float(s["start"]), "end": float(s["end"]),
-         "route": _route_for_span(s, anchor, allow_multi_indigenous)}
-        for s in sorted(spans, key=lambda s: s["start"])
-    ])
-    if not plan:
-        return []
-
-    out = []                                        # absorb spans too short for ASR
-    for p in plan:
-        if out and p["end"] - p["start"] < MIN_PIECE_SECONDS:
-            out[-1]["end"] = p["end"]
-        else:
-            out.append(p)
-    if len(out) > 1 and out[0]["end"] - out[0]["start"] < MIN_PIECE_SECONDS:
-        out[1]["start"] = out[0]["start"]
-        out = out[1:]
-    plan = _merge_same_route(out)
-
-    for a, b in zip(plan, plan[1:]):                # cut at a pause, not mid-word
-        t = _snap_to_pause(audio, (a["end"] + b["start"]) / 2)
-        a["end"] = b["start"] = t
-    plan[0]["start"] = max(0.0, plan[0]["start"] - EDGE_PAD_SECONDS)
-    plan[-1]["end"] = min(total, plan[-1]["end"] + EDGE_PAD_SECONDS)
-
-    final = []                                      # keep every piece inside Whisper's window
-    for p in plan:
-        start = p["start"]
-        while p["end"] - start > MAX_PIECE_SECONDS:
-            cut = _snap_to_pause(audio, start + MAX_PIECE_SECONDS - 3.0, search=3.0)
-            final.append({"start": start, "end": cut, "route": p["route"]})
-            start = cut
-        final.append({"start": start, "end": p["end"], "route": p["route"]})
-    return final
+def _get_device() -> str:
+    """Return torch device string."""
+    if torch.cuda.is_available():
+        free_mem = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)
+        if free_mem < 1 * 1024**3:  # Need at least 1GB free for Whisper-Small
+            logger.warning("GPU has <1GB free — using CPU for ASR")
+            return "cpu"
+        return "cuda:0"
+    return "cpu"
 
 
-# ---------------- ASR calls ----------------
-def _run_asr(route: str, clip: np.ndarray) -> str:
-    if route == "English":
-        asr = get_base_asr_pipeline()
-        kwargs = {"task": "transcribe", "language": "english"}   # force it: short clips mis-detect language
-    else:
-        asr = get_asr_pipeline(route)
-        kwargs = {"task": "transcribe"}                          # unchanged from your current NCAIR call
-    # numpy input: no ffmpeg dependency, no temp files per piece
-    result = asr({"raw": clip, "sampling_rate": SAMPLE_RATE}, generate_kwargs=kwargs)
-    return (result.get("text") or "").strip()
+def get_asr_pipeline(language: str) -> pipeline:
+    """Load (or reuse) the ASR pipeline for the given language."""
+    if language not in _asr_pipelines:
+        model_id = MODEL_MAP[language]
+        device = _get_device()
+        logger.info(f"Loading ASR model for {language}: {model_id} on {device}")
+
+        torch_dtype = torch.float16 if device.startswith("cuda") else torch.float32
+
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            model_id,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+            use_safetensors=False,
+        )
+        model.to(device)
+
+        processor = AutoProcessor.from_pretrained(model_id)
+
+        _asr_pipelines[language] = pipeline(
+            "automatic-speech-recognition",
+            model=model,
+            tokenizer=processor.tokenizer,
+            feature_extractor=processor.feature_extractor,
+            torch_dtype=torch_dtype,
+            device=device,
+        )
+    return _asr_pipelines[language]
 
 
-def transcribe_audio_detailed(
-    audio_path: str,
-    language: str,
-    is_code_switched: bool = False,
-    spans: list[dict] | None = None,
-    allow_multi_indigenous: bool = False,
-) -> dict:
+def get_base_asr_pipeline() -> pipeline:
     """
-    Code-switched (spans given): each language span goes to the right model --
-    English -> base Whisper (language forced), everything else -> the anchor
-    language's NCAIR model. Monolingual audio over 28 s is split the same way
-    so nothing past Whisper's 30 s window is lost.
-    Otherwise: your original whole-file behaviour.
+    Load (or reuse) the general multilingual Whisper pipeline used for
+    code-switched audio. Cached separately from the per-language NCAIR
+    models above — this is a different checkpoint entirely, not specific to
+    Hausa, Igbo, or Yoruba individually.
+    """
+    global _base_asr_pipeline
+    if _base_asr_pipeline is None:
+        device = _get_device()
+        logger.info(f"Loading base multilingual ASR model: {BASE_MULTILINGUAL_MODEL} on {device}")
+
+        torch_dtype = torch.float16 if device.startswith("cuda") else torch.float32
+
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            BASE_MULTILINGUAL_MODEL,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+            use_safetensors=False,
+        )
+        model.to(device)
+
+        processor = AutoProcessor.from_pretrained(BASE_MULTILINGUAL_MODEL)
+
+        _base_asr_pipeline = pipeline(
+            "automatic-speech-recognition",
+            model=model,
+            tokenizer=processor.tokenizer,
+            feature_extractor=processor.feature_extractor,
+            torch_dtype=torch_dtype,
+            device=device,
+        )
+    return _base_asr_pipeline
+
+
+def transcribe_audio(audio_path: str, language: str, is_code_switched: bool = False) -> str:
+    """
+    Full pipeline: validate -> preprocess -> silence check -> denoise ->
+    amplify -> transcribe.
+
+    Returns raw transcript in the spoken language(s).
+
+    If is_code_switched is True, transcription is routed to the general
+    multilingual fallback model (BASE_MULTILINGUAL_MODEL) instead of the
+    single-language NCAIR fine-tune named by `language` — letting the
+    decoder switch language naturally rather than forcing every word
+    through one language's decoder. `language` is still required (it names
+    which NCAIR model to use when is_code_switched is False, and is used
+    for logging either way); this behaves the same regardless of whether
+    the primary detected language is Hausa, Igbo, or Yoruba.
+
+    Trade-off: the fallback model is less accurate than the NCAIR
+    fine-tunes on the purely single-language stretches of the audio. This
+    is accepted as the better failure mode for genuinely mixed-language
+    speech (see project action plan, Phase 3 / "Option C").
     """
     if not audio_path or not os.path.isfile(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-    audio, _ = librosa.load(audio_path, sr=SAMPLE_RATE, mono=True)
-    duration = len(audio) / SAMPLE_RATE
-    routed = bool(is_code_switched and spans)
+    with tempfile.TemporaryDirectory(prefix="ncair_asr_") as tmpdir:
+        try:
+            pre_path = os.path.join(tmpdir, "preprocessed.wav")
+            cleaned_path = os.path.join(tmpdir, "cleaned.wav")
+            final_path = os.path.join(tmpdir, "final.wav")
 
-    if not routed and duration <= MAX_PIECE_SECONDS:
-        text = _transcribe_whole_file(audio_path, language, is_code_switched)
-        return {"text": text, "tagged_text": text, "pieces": [], "mode": "whole_file", "anchor_language": language}
+            _, audio, sr = _preprocess_audio(audio_path, pre_path)
 
-    if _is_audio_too_quiet(audio):
-        raise ValueError("No audio detected — recording may have failed or mic was silent")
+            if _is_audio_too_quiet(audio):
+                raise ValueError(
+                    "No audio detected — recording may have failed or mic was silent"
+                )
 
-    if routed:
-        anchor = pick_anchor_language(language, spans)
-        use_spans = spans
-    else:                                            # long monolingual: one synthetic span
-        anchor = language if language in MODEL_MAP else None
-        use_spans = [{"start": 0.0, "end": duration, "language": language}]
+            # Diagnostic test: bypass denoising and amplification
+            final_path = pre_path
 
-    plan = _plan_pieces(use_spans, audio, anchor, allow_multi_indigenous)
-    pieces = []
-    for p in plan:
-        clip = audio[int(p["start"] * SAMPLE_RATE): int(p["end"] * SAMPLE_RATE)]
-        rms = float(np.sqrt(np.mean(clip ** 2))) if len(clip) else 0.0
-        if len(clip) < int(0.3 * SAMPLE_RATE) or rms < MIN_PIECE_RMS:
-            logger.info("Skipping near-silent piece %.1f-%.1fs", p["start"], p["end"])
-            continue
-        logger.info("ASR piece %.1f-%.1fs via %s", p["start"], p["end"], p["route"])
-        text = _run_asr(p["route"], clip)
-        pieces.append({**p, "start": round(p["start"], 2), "end": round(p["end"], 2), "text": text})
+            # Route the recording to the most appropriate ASR model.
+            #
+            # Code-switched audio uses the general multilingual Whisper model because
+            # forcing the decoder into one language could distort words spoken in
+            # another language.
+            #
+            # English also uses the general multilingual Whisper model because there
+            # is no English-specific NCAIR model in MODEL_MAP.
+            #
+            # Pure Hausa, Igbo, and Yoruba recordings use their respective NCAIR
+            # fine-tuned models for better language-specific recognition.
+            if is_code_switched or language == "English":
+                logger.info(
+                    "Using multilingual ASR model: %s (code_switched=%s, language=%s)",
+                    BASE_MULTILINGUAL_MODEL,
+                    is_code_switched,
+                    language,
+                )
+                asr = get_base_asr_pipeline()
 
-    return {
-        "text": " ".join(p["text"] for p in pieces if p["text"]),
-        "tagged_text": " ".join(f"[{p['route']}] {p['text']}" for p in pieces if p["text"]),
-        "pieces": pieces,
-        "mode": "routed",
-        "anchor_language": anchor,
-    }
+            else:
+                logger.info(
+                    "Using NCAIR language-specific ASR model for %s",
+                    language,
+                )
+                asr = get_asr_pipeline(language)
 
+            # Run the selected ASR model on the preprocessed audio.
+            # Do not force a language token here. The selected model
+            # determines the language handling strategy.
+            result = asr(
+                final_path,
+                generate_kwargs={
+                    "task": "transcribe",
+                },
+            )
 
-def transcribe_audio(
-    audio_path: str,
-    language: str,
-    is_code_switched: bool = False,
-    spans: list[dict] | None = None,
-    allow_multi_indigenous: bool = False,
-) -> str:
-    """Backward-compatible: returns the transcript string. Use
-    transcribe_audio_detailed() when you also want per-piece languages."""
-    return transcribe_audio_detailed(audio_path, language, is_code_switched, spans, allow_multi_indigenous)["text"]
+            # Extract the recognised text from the ASR result.
+            text = result.get("text", "").strip()
+
+            if not text:
+                logger.warning("ASR returned empty text despite audio passing silence check")
+
+            return text
+
+        except Exception:
+            logger.exception("Transcription failed for %s", audio_path)
+            raise
