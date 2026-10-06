@@ -1,25 +1,44 @@
 """
-ASR Stage — converts patient audio (Hausa/Igbo/Yoruba) into raw text using
-NCAIR's Whisper-Small fine-tuned models.
+ASR Stage — converts patient audio (Hausa/Yoruba, with English where mixed in)
+into one raw text transcript using NCAIR's Whisper-Small fine-tuned models.
 
-Fixed for Colab:
-  • Suppresses benign transformers warnings
-  • Uses direct model.generate() instead of pipeline chunking (avoids seq2seq warnings)
-  • Handles long-form audio properly
+🛠🛠🛠 WHAT CHANGED IN THIS REVISION (search for 🛠🛠🛠 to find every change):
+  1. The "diagnostic" shortcut is REMOVED. transcribe_audio() used to push EVERY
+     recording through the generic multilingual model and ignore the detected
+     language entirely. Each language now goes to its own model again:
+         Hausa   → NCAIR1/Hausa-ASR   (language forced to Hausa)
+         Yoruba  → NCAIR1/Yoruba-ASR  (language forced to Yoruba)
+         English → openai/whisper-small (language forced to English; NCAIR has no English model)
+  2. Code-switching is ACTED ON. transcribe_segments() consumes the
+     "transcription plan" produced by audio_language_detect.py (non-overlapping,
+     single-language segments), transcribes each segment with the right model and
+     joins the pieces — in time order — into ONE transcript for the LLM.
+  3. Igbo removed (project scope is Hausa + Yoruba, English only for code-switching).
+  4. Segments longer than Whisper's 30-second window are split at pauses instead
+     of being silently truncated.
+  5. Model loading is thread-safe and cached per model id.
+  6. transcribe_audio() keeps a backward-compatible signature, so older call sites still work.
+
+Hand-off contract with audio_language_detect.py (the plan):
+    [{"start": 0.0, "end": 8.5, "language": "Hausa"}, {"start": 8.5, "end": None, "language": "English"}]
+  `end=None` means "to the end of the audio"; `language=None` means "unknown →
+  generic multilingual model with no forced language".
+
+Note on English output: the NCAIR models are *transcription* fine-tunes, so the
+combined transcript stays in the languages the patient spoke. Translation to
+English and clinical structuring happen in the next stage (structure_note.py).
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import tempfile
+import threading
 import warnings
-from pathlib import Path
-from typing import Final
+from typing import Any, Final, Optional
 
 import librosa
 import numpy as np
-import soundfile as sf
 import torch
 from pydub import AudioSegment
 from pydub.effects import normalize
@@ -32,42 +51,45 @@ warnings.filterwarnings("ignore", message=".*generation_config.*")
 
 logger = logging.getLogger(__name__)
 
+# 🛠🛠🛠 CHANGED: Igbo removed — only Hausa and Yoruba have NCAIR fine-tunes in scope.
 MODEL_MAP: Final = {
     "Hausa": "NCAIR1/Hausa-ASR",
-    "Igbo": "NCAIR1/Igbo-ASR",
     "Yoruba": "NCAIR1/Yoruba-ASR",
 }
 
-# Fallback for code-switched audio: a general multilingual Whisper
-# checkpoint, used WITHOUT a forced language token so the decoder can
-# switch language naturally mid-output. The NCAIR fine-tunes above are each
-# forced via generate_kwargs={"language": ...} — accurate for monolingual
-# speech, but that same forcing actively hurts a recording that genuinely
-# mixes languages, since every word gets pushed through one language's
-# decoder regardless of what was actually said.
-#
-# This applies the same way no matter which of the three supported
-# languages — Hausa, Igbo, or Yoruba — was detected as primary.
-# Code-switching isn't specific to any one of them.
+# General multilingual Whisper checkpoint. 🛠🛠🛠 CHANGED role: it now serves (a) English
+# segments, (b) any segment with an unknown language, (c) a safety net if an NCAIR
+# model cannot be loaded, and (d) the legacy "code-switched, no plan" path.
 BASE_MULTILINGUAL_MODEL: Final = "openai/whisper-small"
 
+# 🛠🛠🛠 CHANGED: Igbo removed, in line with MODEL_MAP.
 SUPPORTED_LANGUAGES = {
     "Hausa",
-    "Igbo",
     "Yoruba",
     "English",
 }
 
+# 🛠🛠🛠 NEW: app language name → Whisper's lowercase language name for generate_kwargs["language"].
+WHISPER_LANGUAGE_NAMES: Final = {"Hausa": "hausa", "Yoruba": "yoruba", "English": "english"}
+
+TARGET_SAMPLE_RATE: Final = 16000  # 🛠🛠🛠 NEW: Whisper's required input rate; one constant instead of repeated literals.
+MAX_ASR_WINDOW_SECONDS: Final = 28.0  # 🛠🛠🛠 NEW: Whisper reads at most 30 s per call; stay under it so nothing is truncated.
+MIN_SEGMENT_SECONDS: Final = 0.3  # 🛠🛠🛠 NEW: shorter slices are skipped — Whisper hallucinates text on near-empty audio.
+SEGMENT_MIN_RMS: Final = 0.003  # 🛠🛠🛠 NEW: per-segment silence floor (matches the detector's quality gate), prevents transcribing dead air.
+_SPLIT_SEARCH_SECONDS: Final = 4.0  # 🛠🛠🛠 NEW: when splitting an over-long segment, look for a pause in the last 4 s of the window.
+_SILENCE_FRAME_SAMPLES: Final = 800  # 🛠🛠🛠 NEW: 50 ms @ 16 kHz — frame size for loudness measurement.
+
 # ── model cache ─────────────────────────────────────────────────────────────
-_asr_pipelines: dict[str, pipeline] = {}
-_base_asr_pipeline: pipeline | None = None
+# 🛠🛠🛠 CHANGED: cache is keyed by MODEL ID (was by language, with a separate base global) so the base model is shared.
+_asr_pipelines: dict[str, Any] = {}
+_pipeline_lock = threading.Lock()  # 🛠🛠🛠 NEW: Gradio can run requests concurrently; prevents loading the same model twice.
 
 
-def _preprocess_audio(audio_path: str, output_path: str) -> tuple[str, np.ndarray, int]:
-    """Resample to 16kHz mono."""
-    audio, sr = librosa.load(audio_path, sr=16000, mono=True)
-    sf.write(output_path, audio, sr)
-    return output_path, audio, sr
+# 🛠🛠🛠 NEW: replaces _preprocess_audio — loads straight to a 16 kHz mono array (no temp WAV round-trip needed any more).
+def _load_audio_16k(audio_path: str) -> np.ndarray:
+    """Load any supported audio file as a 16 kHz mono float32 array."""
+    audio, _ = librosa.load(audio_path, sr=TARGET_SAMPLE_RATE, mono=True)
+    return np.asarray(audio, dtype=np.float32)
 
 
 def _is_audio_too_quiet(audio: np.ndarray, silence_threshold: float = 0.01) -> bool:
@@ -75,6 +97,8 @@ def _is_audio_too_quiet(audio: np.ndarray, silence_threshold: float = 0.01) -> b
     return rms < silence_threshold
 
 
+# NOTE: kept from the original but currently unused (denoise/amplify were bypassed
+# during diagnostics). Left in place so they can be re-enabled after the WER pass.
 def _reduce_noise(audio: np.ndarray, sr: int) -> np.ndarray:
     import noisereduce as nr
     return nr.reduce_noise(y=audio, sr=sr, stationary=False)
@@ -98,13 +122,15 @@ def _get_device() -> str:
     return "cpu"
 
 
-def get_asr_pipeline(language: str) -> pipeline:
-    """Load (or reuse) the ASR pipeline for the given language."""
-    if language not in _asr_pipelines:
-        model_id = MODEL_MAP[language]
-        device = _get_device()
-        logger.info(f"Loading ASR model for {language}: {model_id} on {device}")
+# 🛠🛠🛠 NEW: one generic loader replaces two near-identical copies (per-language + base); cached and lock-protected.
+def _load_pipeline(model_id: str) -> Any:
+    """Load (or reuse) the Whisper ASR pipeline for a Hugging Face model id."""
+    with _pipeline_lock:
+        if model_id in _asr_pipelines:
+            return _asr_pipelines[model_id]
 
+        device = _get_device()
+        logger.info("Loading ASR model %s on %s", model_id, device)
         torch_dtype = torch.float16 if device.startswith("cuda") else torch.float32
 
         model = AutoModelForSpeechSeq2Seq.from_pretrained(
@@ -117,7 +143,7 @@ def get_asr_pipeline(language: str) -> pipeline:
 
         processor = AutoProcessor.from_pretrained(model_id)
 
-        _asr_pipelines[language] = pipeline(
+        _asr_pipelines[model_id] = pipeline(
             "automatic-speech-recognition",
             model=model,
             tokenizer=processor.tokenizer,
@@ -125,104 +151,227 @@ def get_asr_pipeline(language: str) -> pipeline:
             torch_dtype=torch_dtype,
             device=device,
         )
-    return _asr_pipelines[language]
+        return _asr_pipelines[model_id]
 
 
-def get_base_asr_pipeline() -> pipeline:
+def get_asr_pipeline(language: str) -> Any:
+    """Load (or reuse) the NCAIR ASR pipeline for the given language. 🛠🛠🛠 CHANGED: thin wrapper over _load_pipeline."""
+    if language not in MODEL_MAP:
+        raise ValueError(f"No dedicated ASR model for '{language}'. Available: {sorted(MODEL_MAP)}")
+    return _load_pipeline(MODEL_MAP[language])
+
+
+def get_base_asr_pipeline() -> Any:
+    """Load (or reuse) the general multilingual Whisper pipeline. 🛠🛠🛠 CHANGED: thin wrapper over _load_pipeline."""
+    return _load_pipeline(BASE_MULTILINGUAL_MODEL)
+
+
+# ============================================================================
+# 🛠🛠🛠 NEW: SEGMENT-LEVEL TRANSCRIPTION
+# ============================================================================
+
+# 🛠🛠🛠 NEW: pause-finder used when a single-language segment exceeds Whisper's 30 s window.
+def _quietest_sample(audio: np.ndarray, lo: int, hi: int, frame_len: int = _SILENCE_FRAME_SAMPLES) -> int:
+    """Return the sample index at the centre of the quietest frame inside [lo, hi)."""
+    lo = max(0, lo)
+    hi = min(len(audio), hi)
+    n_frames = (hi - lo) // frame_len
+    if n_frames < 1:
+        return hi
+    frames = audio[lo: lo + n_frames * frame_len].reshape(n_frames, frame_len)
+    rms = np.sqrt(np.mean(np.square(frames), axis=1))
+    return lo + int(np.argmin(rms)) * frame_len + frame_len // 2
+
+
+# 🛠🛠🛠 NEW: stops Whisper silently dropping everything after 30 s of one long single-language stretch.
+def _split_for_asr(window: np.ndarray, max_seconds: float = MAX_ASR_WINDOW_SECONDS) -> list[np.ndarray]:
     """
-    Load (or reuse) the general multilingual Whisper pipeline used for
-    code-switched audio. Cached separately from the per-language NCAIR
-    models above — this is a different checkpoint entirely, not specific to
-    Hausa, Igbo, or Yoruba individually.
+    Split audio longer than `max_seconds` into pieces no longer than that, cutting
+    at the quietest point near each limit. Pieces too short to transcribe are dropped.
     """
-    global _base_asr_pipeline
-    if _base_asr_pipeline is None:
-        device = _get_device()
-        logger.info(f"Loading base multilingual ASR model: {BASE_MULTILINGUAL_MODEL} on {device}")
+    max_len = int(max_seconds * TARGET_SAMPLE_RATE)
+    search_len = int(_SPLIT_SEARCH_SECONDS * TARGET_SAMPLE_RATE)
+    min_len = int(MIN_SEGMENT_SECONDS * TARGET_SAMPLE_RATE)
 
-        torch_dtype = torch.float16 if device.startswith("cuda") else torch.float32
-
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            BASE_MULTILINGUAL_MODEL,
-            torch_dtype=torch_dtype,
-            low_cpu_mem_usage=True,
-            use_safetensors=False,
-        )
-        model.to(device)
-
-        processor = AutoProcessor.from_pretrained(BASE_MULTILINGUAL_MODEL)
-
-        _base_asr_pipeline = pipeline(
-            "automatic-speech-recognition",
-            model=model,
-            tokenizer=processor.tokenizer,
-            feature_extractor=processor.feature_extractor,
-            torch_dtype=torch_dtype,
-            device=device,
-        )
-    return _base_asr_pipeline
+    pieces: list[np.ndarray] = []
+    start = 0
+    while len(window) - start > max_len:
+        cut = _quietest_sample(window, start + max_len - search_len, start + max_len)
+        pieces.append(window[start:cut])
+        start = cut
+    pieces.append(window[start:])
+    return [p for p in pieces if len(p) >= min_len]
 
 
-def transcribe_audio(audio_path: str, language: str, is_code_switched: bool = False) -> str:
+# 🛠🛠🛠 NEW: one ASR call with a safe retry — some fine-tuned checkpoints reject a forced `language`.
+def _run_asr_window(pipe: Any, window: np.ndarray, whisper_language: Optional[str]) -> str:
+    """Transcribe one ≤30 s window; retry without a forced language if forcing it raises."""
+    kwargs: dict[str, Any] = {"task": "transcribe"}
+    if whisper_language:
+        kwargs["language"] = whisper_language
+    try:
+        result = pipe({"raw": window, "sampling_rate": TARGET_SAMPLE_RATE}, generate_kwargs=kwargs)
+    except Exception:
+        if "language" not in kwargs:
+            raise
+        logger.warning("Forcing language '%s' failed; retrying without a forced language.", whisper_language)
+        result = pipe({"raw": window, "sampling_rate": TARGET_SAMPLE_RATE}, generate_kwargs={"task": "transcribe"})
+    return (result.get("text") or "").strip()
+
+
+# 🛠🛠🛠 NEW: single place that collapses whitespace and drops empty pieces when stitching text together.
+def _join_texts(texts: list[str]) -> str:
+    """Join text pieces with single spaces, ignoring empty ones."""
+    return " ".join(" ".join(t for t in texts if t).split())
+
+
+# 🛠🛠🛠 NEW: transcribes all pieces of one segment with one specific model.
+def _run_pieces(model_id: str, pieces: list[np.ndarray], whisper_language: Optional[str]) -> str:
+    pipe = _load_pipeline(model_id)
+    return _join_texts([_run_asr_window(pipe, piece, whisper_language) for piece in pieces])
+
+
+# 🛠🛠🛠 NEW: model routing for ONE segment, with a base-model safety net if the dedicated model fails.
+def _transcribe_segment_audio(window: np.ndarray, language: Optional[str]) -> tuple[str, str, str]:
     """
-    Full pipeline: validate -> preprocess -> silence check -> denoise ->
-    amplify -> transcribe.
+    Transcribe one single-language segment.
 
-    Returns raw transcript in the spoken language(s).
+    Returns (text, model_id_used, note). `note` is non-empty only when the
+    dedicated model failed and the base multilingual model was used instead
+    (still with the language forced, so the output stays in the right language).
+    """
+    whisper_language = WHISPER_LANGUAGE_NAMES.get(language) if language else None
+    primary_model = MODEL_MAP.get(language, BASE_MULTILINGUAL_MODEL) if language else BASE_MULTILINGUAL_MODEL
+    pieces = _split_for_asr(window)
 
-    If is_code_switched is True, transcription is routed to the general
-    multilingual fallback model (BASE_MULTILINGUAL_MODEL) instead of the
-    single-language NCAIR fine-tune named by `language` — letting the
-    decoder switch language naturally rather than forcing every word
-    through one language's decoder. `language` is still required (it names
-    which NCAIR model to use when is_code_switched is False, and is used
-    for logging either way); this behaves the same regardless of whether
-    the primary detected language is Hausa, Igbo, or Yoruba.
+    try:
+        return _run_pieces(primary_model, pieces, whisper_language), primary_model, ""
+    except Exception as exc:
+        if primary_model == BASE_MULTILINGUAL_MODEL:
+            raise
+        logger.warning("%s model failed (%s) — falling back to base multilingual model.", language, exc)
+        text = _run_pieces(BASE_MULTILINGUAL_MODEL, pieces, whisper_language)
+        return text, BASE_MULTILINGUAL_MODEL, f"{language} model unavailable; used the general multilingual model instead."
 
-    Trade-off: the fallback model is less accurate than the NCAIR
-    fine-tunes on the purely single-language stretches of the audio. This
-    is accepted as the better failure mode for genuinely mixed-language
-    speech (see project action plan, Phase 3 / "Option C").
+
+# 🛠🛠🛠 NEW: the main entry point for code-switched (or any planned) audio — transcribes each segment and joins them.
+def transcribe_segments(audio_path: str, segments: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Transcribe an audio file segment-by-segment and combine the results.
+
+    `segments` is the transcription plan from audio_language_detect.py:
+        [{"start": float, "end": float | None, "language": "Hausa"|"Yoruba"|"English"|None}, ...]
+    Each segment is sliced from the audio, sent to the model for ITS language,
+    and the texts are joined in time order into one transcript.
+
+    Returns:
+        {
+          "text":           combined transcript (what the LLM stages receive),
+          "segments":       [{"index","start","end","language","text","model","status","note"}...]
+                            status ∈ "ok" | "skipped" (silent/too short) | "failed",
+          "languages_used": languages that actually produced text, in order,
+          "warnings":       human-readable notes (fallbacks, skipped/failed segments),
+        }
+
+    Raises FileNotFoundError, ValueError (silent audio / bad language) or
+    RuntimeError (every non-skipped segment failed).
     """
     if not audio_path or not os.path.isfile(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
+    if not segments:
+        raise ValueError("No segments provided — nothing to transcribe.")
 
-    with tempfile.TemporaryDirectory(prefix="ncair_asr_") as tmpdir:
-        try:
-            pre_path = os.path.join(tmpdir, "preprocessed.wav")
-            cleaned_path = os.path.join(tmpdir, "cleaned.wav")
-            final_path = os.path.join(tmpdir, "final.wav")
+    audio = _load_audio_16k(audio_path)
+    if _is_audio_too_quiet(audio):
+        raise ValueError("No audio detected — recording may have failed or mic was silent")
+    total_seconds = len(audio) / float(TARGET_SAMPLE_RATE)
 
-            _, audio, sr = _preprocess_audio(audio_path, pre_path)
+    ordered = sorted(segments, key=lambda s: float(s.get("start") or 0.0))
+    results: list[dict[str, Any]] = []
+    notes: list[str] = []  # not named `warnings` — that would shadow the imported module
 
-            if _is_audio_too_quiet(audio):
-                raise ValueError(
-                    "No audio detected — recording may have failed or mic was silent"
-                )
+    for index, seg in enumerate(ordered):
+        language = seg.get("language")
+        if language is not None and language not in SUPPORTED_LANGUAGES:
+            raise ValueError(f"Unsupported language '{language}'. Supported: {sorted(SUPPORTED_LANGUAGES)}")
 
-            # Diagnostic test: bypass denoising and amplification
-            final_path = pre_path
+        start = max(0.0, float(seg.get("start") or 0.0))
+        end = total_seconds if seg.get("end") is None else min(float(seg["end"]), total_seconds)
+        window = audio[int(start * TARGET_SAMPLE_RATE): int(end * TARGET_SAMPLE_RATE)]
 
-            # Use one multilingual ASR model for every recording.
-            # Do not force a language, allowing multilingual recognition.
-            logger.info("Using unified multilingual ASR model")
-            
-            asr = get_base_asr_pipeline()
-            
-            result = asr(
-                final_path,
-                generate_kwargs={
-                    "task": "transcribe",
-                },
-            )
-            
-            text = result.get("text", "").strip()
+        entry: dict[str, Any] = {
+            "index": index,
+            "start": round(start, 2),
+            "end": round(end, 2),
+            "language": language,
+            "text": "",
+            "model": None,
+            "status": "ok",
+            "note": "",
+        }
+        label = f"{language or 'unknown language'} segment {entry['start']}s–{entry['end']}s"
 
-            if not text:
-                logger.warning("ASR returned empty text despite audio passing silence check")
+        if len(window) == 0 or (end - start) < MIN_SEGMENT_SECONDS:
+            entry["status"], entry["note"] = "skipped", "too short to transcribe"
+        elif _is_audio_too_quiet(window, SEGMENT_MIN_RMS):
+            entry["status"], entry["note"] = "skipped", "silent"
+        else:
+            try:
+                text, model_id, fallback_note = _transcribe_segment_audio(window, language)
+                entry["text"], entry["model"], entry["note"] = text, model_id, fallback_note
+                if fallback_note:
+                    notes.append(f"{label}: {fallback_note}")
+            except Exception as exc:
+                logger.exception("Transcription failed for %s", label)
+                entry["status"], entry["note"] = "failed", str(exc)
+                notes.append(f"{label} could not be transcribed ({exc}).")
 
-            return text
+        if entry["status"] == "skipped":
+            notes.append(f"{label} skipped ({entry['note']}).")
+        results.append(entry)
 
-        except Exception:
-            logger.exception("Transcription failed for %s", audio_path)
-            raise
+    ok_entries = [e for e in results if e["status"] == "ok"]
+    if not ok_entries and any(e["status"] == "failed" for e in results):
+        raise RuntimeError("Transcription failed for every segment: " + " | ".join(notes))
+
+    text = _join_texts([e["text"] for e in ok_entries])
+    if not text:
+        logger.warning("ASR returned empty text despite audio passing silence check")
+
+    languages_used: list[str] = []
+    for e in ok_entries:
+        if e["text"] and e["language"] and e["language"] not in languages_used:
+            languages_used.append(e["language"])
+
+    return {"text": text, "segments": results, "languages_used": languages_used, "warnings": notes}
+
+
+# ============================================================================
+# BACKWARD-COMPATIBLE ENTRY POINT
+# ============================================================================
+
+def transcribe_audio(
+    audio_path: str,
+    language: Optional[str] = None,  # 🛠🛠🛠 CHANGED: optional now — a plan or the multilingual fallback can replace it
+    is_code_switched: bool = False,
+    segments: Optional[list[dict[str, Any]]] = None,  # 🛠🛠🛠 NEW: the transcription plan from the language detector
+) -> str:
+    """
+    Transcribe audio and return ONE combined transcript string.
+
+    🛠🛠🛠 CHANGED behaviour (signature stays backward compatible):
+      • `segments` given          → each segment is transcribed with its own language's
+                                    model and the pieces are joined (code-switch aware).
+      • no segments, one language → whole file with that language's model.
+      • no segments, `is_code_switched=True` or no language → whole file with the general
+                                    multilingual model and NO forced language (legacy
+                                    "Option C" fallback, used only when no plan exists).
+    Prefer transcribe_segments() when you also want per-segment details.
+    """
+    if segments:
+        plan = segments
+    elif is_code_switched or not language:
+        plan = [{"start": 0.0, "end": None, "language": None}]
+    else:
+        plan = [{"start": 0.0, "end": None, "language": language}]
+    return transcribe_segments(audio_path, plan)["text"]
