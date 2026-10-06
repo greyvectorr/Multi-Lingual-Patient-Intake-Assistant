@@ -73,13 +73,17 @@ DEFAULT_CONFIDENCE_THRESHOLD = 0.50
 # 🛠🛠🛠 CHANGED: "base" instead of "tiny" (tiny is weak on tonal Hausa/Yoruba); override with env var MEDIVOICE_LANGID_MODEL=tiny to revert.
 DEFAULT_DETECTION_MODEL = os.environ.get("MEDIVOICE_LANGID_MODEL", "base")
 
-CHUNK_SECONDS = 5.0
-CHUNK_OVERLAP_SECONDS = 1.0
+# 🛠🛠🛠 CHANGED: 5 s/1 s overlap → 4 s/2 s overlap (2 s step) so a short 10-15 s clip gets ~5 windows instead of 3 and a second language can be confirmed.
+CHUNK_SECONDS = 4.0
+CHUNK_OVERLAP_SECONDS = 2.0
 # 🛠🛠🛠 CHANGED: 0.35 → 0.50 because probabilities are now renormalised over 3 languages (a 3-way floor is already 0.33, so 0.35 would accept anything).
 CHUNK_CONFIDENCE_THRESHOLD = 0.50
 
 # 🛠🛠🛠 NEW: minimum share of Whisper's total probability that must fall on Hausa/Yoruba/English, else the audio is "none of our languages".
 MIN_SUPPORTED_PROBABILITY_MASS: Final = 0.30
+
+# 🛠🛠🛠 NEW: a second language is confirmed once its reliable windows own this many seconds of audio (replaces "≥2 windows", which rejected short clips).
+MIN_CONFIRMED_LANGUAGE_SECONDS: Final = 3.0
 
 # 🛠🛠🛠 NEW: language runs shorter than this are absorbed by a neighbour (a 1-second "switch" is detector noise, not a real switch).
 MIN_RUN_SECONDS: Final = 1.5
@@ -452,26 +456,29 @@ def infer_code_switching(segments: List[Dict[str, Any]]) -> Dict[str, Any]:
     Flag code-switching if a second language shows up with enough support to
     trust it — not just one noisy chunk.
 
-    A single reliable chunk of a second language, out of many chunks total,
-    is more likely detector noise (a mis-guessed 5-second window) than a
-    genuine switch. We require a language to appear in at least 2 reliable
-    chunks before counting it — unless the recording is so short that a
-    second confirming chunk was never realistically possible, in which case
-    we still trust a single reliable chunk (there's nothing more to check
-    it against).
+    🛠🛠🛠 CHANGED: support is now measured in SECONDS OF AUDIO owned by a language's
+    reliable windows (>= MIN_CONFIRMED_LANGUAGE_SECONDS), not in a window count.
+    The old "at least 2 windows" rule threw away a genuine English half in short
+    recordings (an 11 s clip only has ~3 windows, so English could win just one).
+    A lone noisy window still owns only ~2 s, so it is still rejected. As before,
+    if there are <= 2 reliable windows in total there is nothing to cross-check
+    against, so they are trusted.
     """
     reliable = [s for s in segments if s.get("reliable") and s.get("language")]
     total_reliable = len(reliable)
 
-    counts: Dict[str, int] = {}
-    for s in reliable:
-        counts[s["language"]] = counts.get(s["language"], 0) + 1
+    seconds: Dict[str, float] = {}
+    if segments:
+        regions = _chunk_regions(segments, segments[-1]["end"])
+        for seg, (start, end) in zip(segments, regions):
+            if seg.get("reliable") and seg.get("language"):
+                seconds[seg["language"]] = seconds.get(seg["language"], 0.0) + max(0.0, end - start)
 
-    # Most-frequent reliable language first, for a more informative order.
-    ordered = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+    # Most-audio first, for a more informative order.
+    ordered = sorted(seconds.items(), key=lambda kv: kv[1], reverse=True)
     languages = [
-        lang for lang, count in ordered
-        if count >= 2 or total_reliable <= 2
+        lang for lang, secs in ordered
+        if secs >= MIN_CONFIRMED_LANGUAGE_SECONDS or total_reliable <= 2
     ]
     indigenous_languages = [lang for lang in languages if lang in TARGET_INDIGENOUS_LANGUAGES]
 
@@ -938,6 +945,13 @@ def detect_audio_language(audio_path: str) -> dict[str, Any]:
     # flag switching.
     switch_info = run_pre_asr_code_switch_screening(audio_path, audio=audio)
     segments = switch_info.get("segments", [])
+    # 🛠🛠🛠 NEW: one INFO line per window so a misdetection can be diagnosed from the log instead of guessed at.
+    for seg in segments:
+        logger.info(
+            "Language window %.1fs-%.1fs -> %s (%.2f, %s)",
+            seg["start"], seg["end"], seg["language"], seg["confidence"],
+            "reliable" if seg["reliable"] else "unreliable",
+        )
 
     # 3. Primary-language ID. whisper.detect_language() always pads/trims to
     # a single 30-second window, so for anything longer we aggregate the
