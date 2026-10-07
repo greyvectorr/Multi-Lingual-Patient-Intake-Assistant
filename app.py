@@ -801,7 +801,7 @@ def process_intake(
             duration=note.get("duration", ""),
             severity=note.get("severity", ""),
             history=note.get("history", ""),
-            possible_recommendations=note.get("possible_recommendations", ""),
+            patient_concerns=note.get("patient_concerns", ""),
             language=language_label,
             keywords=keywords,
             transcript=transcript,
