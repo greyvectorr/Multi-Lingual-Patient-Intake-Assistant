@@ -64,6 +64,11 @@ RECOMMENDATIONS_DISCLAIMER = (
     "or inaccurate. Clinical judgment should always take precedence."
 )
 
+PATIENT_CONCERNS_HELP = (
+    "Questions, worries, or requests explicitly expressed by the patient. "
+    "This field captures the patient's expressed concerns, not clinical advice."
+)
+
 # ── theme ───────────────────────────────────────────────────────────────────
 COLOR_BG = "#F7F9FA"
 COLOR_WHITE = "#FFFFFF"
