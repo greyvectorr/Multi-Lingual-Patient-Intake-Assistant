@@ -306,6 +306,7 @@ def transcribe_segments(audio_path: str, segments: list[dict[str, Any]]) -> dict
             "language": language,
             "text": "",
             "model": None,
+            "confidence": seg.get("confidence"),  # 🛠🛠🛠 NEW: detector confidence passed through so the UI can show it per segment
             "status": "ok",
             "note": "",
         }

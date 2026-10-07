@@ -115,6 +115,94 @@ class TestShortClipCodeSwitching:
         assert ald.infer_code_switching(segs)["languages_seen"] == ["Yoruba"]
 
 
+class TestWholeAudioNoLongerOverridesWindows:
+    """Regression for the reported bug: windows said English but the app transcribed as Yoruba."""
+
+    def test_disagreement_asks_the_nurse_with_candidates_preselected(self, tmp_path, monkeypatch):
+        sf = pytest.importorskip("soundfile")
+        path = tmp_path / "clip.wav"
+        sf.write(str(path), _noise(11.4, 0.1), SR)
+        monkeypatch.setattr(ald, "load_language_id_model", lambda *a, **k: object())
+        # 4 s windows -> English; the 11.4 s whole recording -> Yoruba
+        monkeypatch.setattr(
+            ald, "_language_probabilities",
+            lambda m, w: {"yo": 0.9, "en": 0.05, "ha": 0.05} if len(w) > 5 * SR else {"en": 0.95, "yo": 0.03, "ha": 0.02},
+        )
+        result = ald.detect_audio_language(str(path))
+        assert result["needs_manual_selection"] is True
+        assert result["detected_language"] is None
+        assert set(result["suggested_languages"]) == {"English", "Yoruba"}
+        assert result["transcription_plan"] == []
+
+    def test_agreement_keeps_single_language(self, tmp_path, monkeypatch):
+        sf = pytest.importorskip("soundfile")
+        path = tmp_path / "clip.wav"
+        sf.write(str(path), _noise(11.4, 0.1), SR)
+        monkeypatch.setattr(ald, "load_language_id_model", lambda *a, **k: object())
+        monkeypatch.setattr(ald, "_language_probabilities", lambda m, w: {"yo": 0.9, "en": 0.05, "ha": 0.05})
+        result = ald.detect_audio_language(str(path))
+        assert result["detected_languages"] == ["Yoruba"]
+        assert result["language_confidences"]["Yoruba"] > 0.8
+
+
+class TestRelativeRelabelling:
+    def _manual_clip(self, tmp_path, monkeypatch):
+        sf = pytest.importorskip("soundfile")
+        path = tmp_path / "clip.wav"
+        audio = np.concatenate([_noise(6.0, 0.1), _noise(6.0, 0.4, seed=1)])
+        sf.write(str(path), audio, SR)
+        monkeypatch.setattr(ald, "load_language_id_model", lambda *a, **k: object())
+
+        def biased(model, window):
+            # English-biased classifier: says English everywhere, but Yoruba is relatively higher in the quiet half
+            loud = float(np.mean(np.abs(window))) > 0.2
+            return {"en": 0.99, "yo": 0.005, "ha": 0.005} if loud else {"en": 0.90, "yo": 0.09, "ha": 0.01}
+
+        monkeypatch.setattr(ald, "_language_probabilities", biased)
+        return str(path)
+
+    def test_manual_two_languages_finds_the_switch_despite_english_bias(self, tmp_path, monkeypatch):
+        path = self._manual_clip(tmp_path, monkeypatch)
+        info = ald.build_plan_for_selected_languages(path, ["Yoruba", "English"])
+        assert info["is_code_switched"] is True
+        plan = info["transcription_plan"]
+        assert [p["language"] for p in plan] == ["Yoruba", "English"]
+        assert 3.5 <= plan[0]["end"] <= 8.5
+        assert set(info["language_confidences"]) == {"Yoruba", "English"}
+
+    def test_absolute_argmax_would_have_missed_it(self, tmp_path, monkeypatch):
+        path = self._manual_clip(tmp_path, monkeypatch)
+        segs = ald.detect_chunk_languages(path, confidence_threshold=0.0, allowed_languages=["Yoruba", "English"], enforce_support_mass=False)
+        assert {s["language"] for s in segs} == {"English"}  # why relative relabelling exists
+
+    def test_relabel_is_noop_for_single_language_or_missing_probabilities(self):
+        segs = _windows(["Hausa"] * 3)
+        assert ald.relabel_windows_relative(segs, ["Hausa"]) is segs
+        assert ald.relabel_windows_relative(segs, ["Hausa", "English"]) is segs
+
+
+class TestPriorAndConfidences:
+    def test_indigenous_prior_boosts_hausa_yoruba(self, monkeypatch):
+        probs = {"yo": 0.2, "en": 0.4, "ha": 0.0}
+        base, _ = ald._restrict_to_supported(probs)
+        monkeypatch.setattr(ald, "INDIGENOUS_PRIOR_WEIGHT", 4.0)
+        boosted, mass = ald._restrict_to_supported(probs)
+        assert base["English"] > base["Yoruba"]
+        assert boosted["Yoruba"] > boosted["English"]
+        assert mass == pytest.approx(0.6)  # mass guard still uses the raw probabilities
+
+    def test_language_confidences_are_duration_weighted(self):
+        plan = [
+            {"start": 0.0, "end": 6.0, "language": "Hausa", "confidence": 0.9},
+            {"start": 6.0, "end": 8.0, "language": "English", "confidence": 0.5},
+            {"start": 8.0, "end": 12.0, "language": "Hausa", "confidence": 0.6},
+        ]
+        conf = ald._language_confidences(plan)
+        assert list(conf) == ["Hausa", "English"]
+        assert conf["Hausa"] == pytest.approx((0.9 * 6 + 0.6 * 4) / 10, abs=1e-3)
+        assert conf["English"] == pytest.approx(0.5)
+
+
 class TestTranscriptionPlan:
     def test_single_language_is_one_whole_segment(self):
         plan = ald.build_transcription_plan(_windows(["Hausa"] * 3), ["Hausa"], 13.0)

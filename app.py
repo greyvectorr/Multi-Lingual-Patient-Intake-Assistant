@@ -181,6 +181,8 @@ class DetectionResult:
     detected_languages: list[str] = field(default_factory=list)  # 🛠🛠🛠 NEW: all languages found, largest share first
     transcription_plan: list[dict] = field(default_factory=list)  # 🛠🛠🛠 NEW: segments handed to transcribe.py
     failure_reason: str = ""  # 🛠🛠🛠 NEW: shown to the nurse when the manual selector appears
+    language_confidences: dict[str, float] = field(default_factory=dict)  # 🛠🛠🛠 NEW: confidence for EACH detected language
+    suggested_languages: list[str] = field(default_factory=list)  # 🛠🛠🛠 NEW: candidates pre-ticked in the manual selector
 
 
 # 🛠🛠🛠 NEW: the language decision for one intake (auto OR manual) in a single object so process_intake stays readable.
@@ -382,9 +384,11 @@ def _format_plan_timeline(plan: list[dict]) -> str:
         start = seg.get("start") or 0.0
         end = seg.get("end")
         end_text = f"{end:.1f}s" if end is not None else "end"
+        conf = seg.get("confidence")
+        conf_text = f" · {conf:.0%} confidence" if isinstance(conf, (int, float)) else ""  # 🛠🛠🛠 NEW: confidence per segment
         rows.append(
             f'<div class="segment-row"><span class="segment-time">{start:.1f}s – {end_text}</span>'
-            f'{_html.escape(str(seg.get("language") or "Unknown"))}</div>'
+            f'{_html.escape(str(seg.get("language") or "Unknown"))}{conf_text}</div>'
         )
     return f'<div style="margin-top:8px;">{"".join(rows)}</div>' if rows else ""
 
@@ -406,12 +410,16 @@ def _format_detection_banner(dr: DetectionResult | None) -> str:
         return (
             '<div class="lang-banner warn"><b>⚠ Language not detected automatically</b>'
             f"<div>{reason}</div>"
-            "<div>Please select the language(s) spoken in the recording below.</div></div>"
+            "<div>Please confirm the language(s) spoken in the recording below"
+            + (f" (suggested: {_html.escape(', '.join(dr.suggested_languages))})" if dr.suggested_languages else "")
+            + ".</div></div>"
         )
 
     if dr.is_code_switched:
+        # 🛠🛠🛠 CHANGED: each chip now shows the language, its share of speech AND its own confidence.
         chips = "".join(
-            f'<span class="lang-chip">{_html.escape(lang)} · {share:.0%}</span>'
+            f'<span class="lang-chip">{_html.escape(lang)} · {share:.0%} of speech · '
+            f'{dr.language_confidences.get(lang, 0.0):.0%} confidence</span>'
             for lang, share in dr.code_switch_candidates
         )
         return (
@@ -441,9 +449,11 @@ def _format_segment_breakdown(segment_results: list[dict] | None) -> str:
         else:
             note = _html.escape(seg.get("note") or "")
             text = f'<i style="color:{COLOR_TEXT_MUTED};">({_html.escape(str(seg.get("status")))}: {note})</i>'
+        conf = seg.get("confidence")
+        conf_text = f" · {conf:.0%}" if isinstance(conf, (int, float)) else ""  # 🛠🛠🛠 NEW: detector confidence per transcribed segment
         rows.append(
             f'<div class="segment-row"><span class="segment-time">{seg.get("start", 0):.1f}s – {seg.get("end", 0):.1f}s</span>'
-            f'<span class="lang-chip">{language}</span>{text}</div>'
+            f'<span class="lang-chip">{language}{conf_text}</span>{text}</div>'
         )
 
     return f"""<div class="transparency-panel">
@@ -572,6 +582,8 @@ def _to_detection_result(result: dict[str, Any]) -> DetectionResult:
         detected_languages=languages,
         transcription_plan=plan,
         failure_reason=result.get("failure_reason", ""),
+        language_confidences=dict(result.get("language_confidences") or {}),
+        suggested_languages=list(result.get("suggested_languages") or []),
     )
 
 
@@ -613,7 +625,10 @@ def run_language_detection(audio_path: str | None) -> tuple:
 
     if dr.reliable:
         if dr.is_code_switched and dr.code_switch_candidates:
-            candidates = ", ".join(f"{lang} ({share:.0%})" for lang, share in dr.code_switch_candidates)
+            candidates = ", ".join(
+                f"{lang} ({share:.0%} of speech, {dr.language_confidences.get(lang, 0.0):.0%} confidence)"
+                for lang, share in dr.code_switch_candidates
+            )  # 🛠🛠🛠 CHANGED: confidence shown for EACH language
             msg = (
                 f"⚠ Code-switching detected: {candidates}. "
                 "Each segment will be transcribed with the model for its own language."
@@ -626,7 +641,8 @@ def run_language_detection(audio_path: str | None) -> tuple:
         f"⚠ {dr.failure_reason or 'Language could not be detected reliably.'} "
         "Please select the language(s) spoken below — choose more than one if the patient switches languages."
     )
-    return gr.update(visible=True), gr.update(value=[]), msg, banner, dr
+    # 🛠🛠🛠 CHANGED: candidate languages are pre-ticked so the nurse only has to confirm (or correct) them.
+    return gr.update(visible=True), gr.update(value=list(dr.suggested_languages)), msg, banner, dr
 
 
 # 🛠🛠🛠 NEW: one place to build the 13-value error/blank return so every early exit stays aligned with the Gradio outputs list.

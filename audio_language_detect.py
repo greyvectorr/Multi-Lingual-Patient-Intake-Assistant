@@ -31,6 +31,15 @@ Kept from the original:
      those languages — so a manual multi-language choice is acted on too.
   6. code_switch_candidates now carries each language's SHARE OF SPEECH (derived
      from the plan) instead of a made-up 0.35 placeholder confidence.
+  7. 🛠🛠🛠 BUG FIX: the whole-recording result used to silently OVERRIDE the window-level
+     result when windows named a single language (windows said English, UI/ASR used
+     Yoruba). Disagreement is now treated as "detection uncertain": the nurse is asked,
+     with the candidate languages pre-selected (suggested_languages).
+  8. 🛠🛠🛠 The manual multi-language path now labels windows by RELATIVE evidence
+     (see relabel_windows_relative), so a classifier that is biased towards English
+     can still be used to find where the other language starts.
+  9. 🛠🛠🛠 Per-language confidence (language_confidences) is returned for the UI, and
+     every window logs Whisper's raw top-3 so misdetections can be diagnosed.
 """
 
 from __future__ import annotations
@@ -70,8 +79,24 @@ LANGUAGE_NAME_TO_CODE: Final = {name: code for code, name in SUPPORTED_LANGUAGES
 TARGET_INDIGENOUS_LANGUAGES = {"Hausa", "Yoruba"}
 
 DEFAULT_CONFIDENCE_THRESHOLD = 0.50
-# 🛠🛠🛠 CHANGED: "base" instead of "tiny" (tiny is weak on tonal Hausa/Yoruba); override with env var MEDIVOICE_LANGID_MODEL=tiny to revert.
-DEFAULT_DETECTION_MODEL = os.environ.get("MEDIVOICE_LANGID_MODEL", "base")
+# 🛠🛠🛠 CHANGED: "small" (was "tiny"/"base" — both labelled Yoruba speech as English); set MEDIVOICE_LANGID_MODEL=medium for even better Yoruba/Hausa ID.
+DEFAULT_DETECTION_MODEL = os.environ.get("MEDIVOICE_LANGID_MODEL", "small")
+
+
+# 🛠🛠🛠 NEW: reads MEDIVOICE_INDIGENOUS_PRIOR safely so a typo in the env var cannot crash the app.
+def _read_indigenous_prior() -> float:
+    try:
+        value = float(os.environ.get("MEDIVOICE_INDIGENOUS_PRIOR", "1.0"))
+        return value if value > 0 else 1.0
+    except ValueError:
+        return 1.0
+
+
+# 🛠🛠🛠 NEW: multiplier on Hausa/Yoruba probabilities to counter Whisper's English bias; 1.0 = off (untuned — raise only after checking the raw-top3 logs).
+INDIGENOUS_PRIOR_WEIGHT: float = _read_indigenous_prior()
+
+# 🛠🛠🛠 NEW: floor for a language's mean probability in relative scoring, so a near-zero mean cannot blow scores up.
+RELATIVE_SCORE_FLOOR: Final = 0.02
 
 # 🛠🛠🛠 CHANGED: 5 s/1 s overlap → 4 s/2 s overlap (2 s step) so a short 10-15 s clip gets ~5 windows instead of 3 and a second language can be confirmed.
 CHUNK_SECONDS = 4.0
@@ -290,10 +315,17 @@ def _restrict_to_supported(
         code for code, name in SUPPORTED_LANGUAGES.items()
         if allowed is None or name in allowed
     ]
-    mass = sum(float(probs.get(code, 0.0)) for code in codes)
+    raw = {SUPPORTED_LANGUAGES[code]: float(probs.get(code, 0.0)) for code in codes}
+    mass = sum(raw.values())
     if mass <= 0.0:
         return {}, 0.0
-    return {SUPPORTED_LANGUAGES[code]: float(probs.get(code, 0.0)) / mass for code in codes}, mass
+    # 🛠🛠🛠 NEW: optional prior (default 1.0 = no change) boosting Hausa/Yoruba before renormalising.
+    weighted = {
+        name: p * (INDIGENOUS_PRIOR_WEIGHT if name in TARGET_INDIGENOUS_LANGUAGES else 1.0)
+        for name, p in raw.items()
+    }
+    total = sum(weighted.values())
+    return {name: w / total for name, w in weighted.items()}, mass
 
 
 # ============================================================
@@ -443,6 +475,10 @@ def detect_chunk_languages(
             "language": language,
             "confidence": round(confidence, 3),
             "reliable": reliable,
+            # 🛠🛠🛠 NEW: full per-language scores (used by relative relabelling), Whisper's raw top-3 and supported mass (used for diagnosis logs).
+            "probabilities": dict(restricted),
+            "raw_top3": [[c, round(float(v), 3)] for c, v in sorted(probs.items(), key=lambda kv: kv[1], reverse=True)[:3]],
+            "supported_mass": round(mass, 3),
         })
 
         if end_sample >= total_samples:
@@ -508,6 +544,55 @@ def run_pre_asr_code_switch_screening(
             "segments": [],
             "error": str(exc),
         }
+
+
+# ============================================================
+# 🛠🛠🛠 NEW: RELATIVE RELABELLING (manual multi-language path)
+# ============================================================
+
+# 🛠🛠🛠 NEW: light smoothing so one noisy window cannot flip a label on its own.
+def _smooth(values: List[float]) -> List[float]:
+    """3-tap [0.25, 0.5, 0.25] moving average with edge replication."""
+    n = len(values)
+    if n < 3:
+        return list(values)
+    padded = [values[0]] + list(values) + [values[-1]]
+    return [0.25 * padded[i] + 0.5 * padded[i + 1] + 0.25 * padded[i + 2] for i in range(n)]
+
+
+# 🛠🛠🛠 NEW: works around an English-biased classifier — when the nurse says language A and B are both present, label each window by which language is RELATIVELY stronger there.
+def relabel_windows_relative(segments: List[Dict[str, Any]], languages: List[str]) -> List[Dict[str, Any]]:
+    """
+    Whisper's language ID is biased towards English for Nigerian-language speech,
+    so a window of Yoruba can still score "English 0.93, Yoruba 0.06". An absolute
+    arg-max would label the whole clip English. But if we KNOW both languages are
+    present, the signal is in how each language's score changes across the clip:
+    each window is scored as  p(language, window) / mean p(language, clip)  and
+    labelled with the language that is most above its own average. Windows keep
+    their original label if probabilities are unavailable. Returns new dicts
+    (confidence = that language's share of the relative scores, reliable = True).
+    """
+    valid = set(SUPPORTED_LANGUAGES.values())
+    languages = [lang for lang in languages if lang in valid]
+    if len(languages) < 2 or not segments or any("probabilities" not in seg for seg in segments):
+        return segments
+
+    smoothed = {
+        lang: _smooth([float(seg["probabilities"].get(lang, 0.0)) for seg in segments])
+        for lang in languages
+    }
+    means = {lang: max(float(np.mean(values)), RELATIVE_SCORE_FLOOR) for lang, values in smoothed.items()}
+
+    relabelled: List[Dict[str, Any]] = []
+    for i, seg in enumerate(segments):
+        scores = {lang: smoothed[lang][i] / means[lang] for lang in languages}
+        total = sum(scores.values())
+        new_seg = dict(seg)
+        if total > 0:
+            best = max(scores, key=scores.get)
+            new_seg.update(language=best, confidence=round(scores[best] / total, 3), reliable=True)
+        relabelled.append(new_seg)
+    return relabelled
 
 
 # ============================================================
@@ -733,6 +818,21 @@ def _language_shares(plan: List[Dict[str, Any]]) -> Dict[str, float]:
     return {lang: round(duration / grand_total, 3) for lang, duration in ordered}
 
 
+# 🛠🛠🛠 NEW: per-language confidence (duration-weighted over that language's segments) so the UI can show a confidence next to EACH language.
+def _language_confidences(plan: List[Dict[str, Any]]) -> Dict[str, float]:
+    """Return {language: duration-weighted mean confidence}, in order of speech share."""
+    weighted: Dict[str, float] = {}
+    durations: Dict[str, float] = {}
+    for run in plan:
+        end = run.get("end")
+        duration = (end - run["start"]) if end is not None else 1.0
+        duration = duration if duration > 0 else 1e-6
+        weighted[run["language"]] = weighted.get(run["language"], 0.0) + float(run.get("confidence", 0.0)) * duration
+        durations[run["language"]] = durations.get(run["language"], 0.0) + duration
+    shares_order = list(_language_shares(plan)) or list(weighted)
+    return {lang: round(weighted[lang] / durations[lang], 3) for lang in shares_order if lang in weighted}
+
+
 # 🛠🛠🛠 NEW: builds the plain-English hint handed to the N-ATLaS LLM (replaces inline string-building in detect_audio_language).
 def _build_context_note(
     languages: List[str],
@@ -766,9 +866,12 @@ def _build_failed_detection(
     quality: Optional[AudioQuality] = None,
     segments: Optional[List[Dict[str, Any]]] = None,
     raw_probabilities: Optional[Dict[str, float]] = None,
+    suggested_languages: Optional[List[str]] = None,  # 🛠🛠🛠 NEW: candidate languages the UI pre-selects for the nurse to confirm
 ) -> Dict[str, Any]:
     """Return the same dict shape as a success, flagged needs_manual_selection=True."""
     return {
+        "suggested_languages": list(suggested_languages or []),  # 🛠🛠🛠 NEW
+        "language_confidences": {},  # 🛠🛠🛠 NEW: keeps the dict shape identical to a success
         "detected_language": None,
         "detected_languages": [],
         "confidence": 0.0,
@@ -849,6 +952,7 @@ def build_plan_for_selected_languages(
             "transcription_plan": plan,
             "segments": [],
             "code_switch_candidates": [],
+            "language_confidences": {languages[0]: 1.0},  # 🛠🛠🛠 NEW: nurse-selected, so full confidence
             "context_note": _build_context_note(languages, {languages[0]: 1.0}, False, 1.0, manually_selected=True),
         }
 
@@ -862,7 +966,10 @@ def build_plan_for_selected_languages(
         allowed_languages=languages,
         enforce_support_mass=False,
     )
-    plan = build_transcription_plan(segments, languages, total_seconds, audio=audio)
+    # 🛠🛠🛠 NEW: label windows by relative evidence, then keep only languages that own enough audio (same rule as the auto path).
+    segments = relabel_windows_relative(segments, languages)
+    confirmed = infer_code_switching(segments)["languages_seen"] or languages[:1]
+    plan = build_transcription_plan(segments, confirmed, total_seconds, audio=audio)
     shares = _language_shares(plan)
     planned_languages = list(shares) or [languages[0]]
     is_code_switched = len(planned_languages) >= 2
@@ -873,6 +980,7 @@ def build_plan_for_selected_languages(
         "transcription_plan": plan,
         "segments": segments,
         "code_switch_candidates": list(shares.items()) if is_code_switched else [],
+        "language_confidences": _language_confidences(plan),  # 🛠🛠🛠 NEW
         "context_note": _build_context_note(planned_languages, shares, is_code_switched, 1.0, manually_selected=True),
     }
 
@@ -947,10 +1055,11 @@ def detect_audio_language(audio_path: str) -> dict[str, Any]:
     segments = switch_info.get("segments", [])
     # 🛠🛠🛠 NEW: one INFO line per window so a misdetection can be diagnosed from the log instead of guessed at.
     for seg in segments:
+        raw_top = ", ".join(f"{code} {prob:.2f}" for code, prob in seg.get("raw_top3", []))
         logger.info(
-            "Language window %.1fs-%.1fs -> %s (%.2f, %s)",
+            "Language window %.1fs-%.1fs -> %s (%.2f, %s) | whisper raw top3: %s | supported mass %.2f",
             seg["start"], seg["end"], seg["language"], seg["confidence"],
-            "reliable" if seg["reliable"] else "unreliable",
+            "reliable" if seg["reliable"] else "unreliable", raw_top, seg.get("supported_mass", 0.0),
         )
 
     # 3. Primary-language ID. whisper.detect_language() always pads/trims to
@@ -962,15 +1071,33 @@ def detect_audio_language(audio_path: str) -> dict[str, Any]:
     else:
         lang_result = _detect_whole_audio_language(audio_path, audio=audio)
 
-    # 🛠🛠🛠 NEW: decide WHICH languages to act on.
-    #   ≥2 languages confirmed by chunk screening → code-switching, trust the chunks;
-    #   otherwise a single language only if whole-audio ID (more context) is reliable;
-    #   otherwise detection failed → the UI asks the nurse.
+    # 🛠🛠🛠 CHANGED: decide WHICH languages to act on. The whole-recording result no longer overrides the windows.
+    #   ≥2 languages confirmed by the windows → code-switching, trust the windows;
+    #   windows name ONE language and the whole recording agrees → that language;
+    #   windows and whole recording DISAGREE → uncertain, ask the nurse (candidates pre-selected);
+    #   only the whole recording is reliable → that language; nothing reliable → ask the nurse.
     chunk_languages = list(switch_info.get("languages_seen", []))
+    whole_language = lang_result.detected_language if lang_result.auto_detect_reliable else None
+    logger.info(
+        "Language ID summary: windows -> %s | whole recording -> %s (%.2f, %s)",
+        chunk_languages or "none", lang_result.detected_language or "none",
+        lang_result.confidence, "reliable" if lang_result.auto_detect_reliable else "unreliable",
+    )
+
     if len(chunk_languages) >= 2:
         languages = chunk_languages
-    elif lang_result.auto_detect_reliable and lang_result.detected_language:
-        languages = [lang_result.detected_language]
+    elif chunk_languages and whole_language and whole_language != chunk_languages[0]:
+        suggested = [chunk_languages[0], whole_language]
+        return _build_failed_detection(
+            f"The 4-second windows say {chunk_languages[0]} but the whole recording says {whole_language}. "
+            "This usually means the patient switches language — please confirm the language(s).",
+            quality=quality, segments=segments, raw_probabilities=lang_result.raw_probabilities,
+            suggested_languages=suggested,
+        )
+    elif chunk_languages and whole_language:
+        languages = chunk_languages
+    elif whole_language and not chunk_languages:
+        languages = [whole_language]
     else:
         languages = []
 
@@ -980,6 +1107,7 @@ def detect_audio_language(audio_path: str) -> dict[str, Any]:
             quality=quality,
             segments=segments,
             raw_probabilities=lang_result.raw_probabilities,
+            suggested_languages=chunk_languages,
         )
 
     # 4. 🛠🛠🛠 NEW: transcription plan — what turns "detected" into "acted on".
@@ -1010,6 +1138,8 @@ def detect_audio_language(audio_path: str) -> dict[str, Any]:
     return {
         "detected_language": primary_language,  # 🛠🛠🛠 CHANGED: never silently "English" — None is returned on failure instead
         "detected_languages": plan_languages,
+        "language_confidences": _language_confidences(plan),  # 🛠🛠🛠 NEW: confidence per language, for the UI
+        "suggested_languages": [],  # 🛠🛠🛠 NEW: only filled on failure
         "confidence": float(confidence),
         "auto_detect_reliable": True,
         "needs_manual_selection": False,
