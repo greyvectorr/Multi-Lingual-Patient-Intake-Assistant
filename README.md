@@ -39,25 +39,26 @@ flowchart LR
 | Yoruba | `NCAIR1/Yoruba-ASR` | Fine-tuned Whisper-Small |
 | English | `openai/whisper-small` | No NCAIR English model; mainly present because patients code-switch into English |
 
-Igbo was removed from scope. Some Igbo leftovers remain in the repo (see [Known issues](#known-issues)).
+Igbo was removed from scope. Some Igbo leftovers remain in the repo (see [Known issues](#known-issues)). This was done just in case you
+wish to apply it yourself.
 
 ---
 
 ## Repository layout
 
-The repository is flat — every module sits at the root. Detailed documentation for each file lives in [`docs/`](docs/).
+The repository is flat — every module sits at the root. Detailed documentation for each file lives in separate folders.
 
 | File / folder | Role | Docs |
 |---|---|---|
-| `app.py` | Gradio web app: dashboard, nurse intake, doctor queue and review | [docs/app.md](docs/app.md) |
-| `app_colab.py` | Three-line Colab launcher (`share=True`) | [docs/app_colab.md](docs/app_colab.md) |
-| `audio_language_detect.py` | Pre-ASR stage: audio quality gate, language ID, code-switch detection, transcription plan | [docs/audio_language_detect.md](docs/audio_language_detect.md) |
-| `transcribe.py` | ASR stage: segment-by-segment transcription with the right model per language | [docs/transcribe.md](docs/transcribe.md) |
-| `structure_note.py` | Local LLM: translation, structured note, evidence verification | [docs/structure_note.md](docs/structure_note.md) |
-| `extract_keywords.py` | LLM keyword extraction + HTML highlighting | [docs/extract_keywords.md](docs/extract_keywords.md) |
-| `clinical_note.py` | SQLite schema, review queue, history, CSV export | [docs/clinical_note.md](docs/clinical_note.md) |
-| `setup_models.py` | Pre-download script for models | [docs/setup_models.md](docs/setup_models.md) |
-| `test_language_segmentation.py` | Pytest suite for detection, segmentation and routing | [docs/test_language_segmentation.md](docs/test_language_segmentation.md) |
+| `app.py` | Gradio web app: dashboard, nurse intake, doctor queue and review | [docs/app.md](app/app.md) |
+| `app_colab.py` | Three-line Colab launcher (`share=True`) | [docs/app_colab.md](app/app_colab.md) |
+| `audio_language_detect.py` | Pre-ASR stage: audio quality gate, language ID, code-switch detection, transcription plan | [docs/audio_language_detect.md](nlp/audio_language_detect.md) |
+| `transcribe.py` | ASR stage: segment-by-segment transcription with the right model per language | [docs/transcribe.md](transcribe/transcribe.md) |
+| `structure_note.py` | Local LLM: translation, structured note, evidence verification | [docs/structure_note.md](notes/structure_note.md) |
+| `extract_keywords.py` | LLM keyword extraction + HTML highlighting | [docs/extract_keywords.md](notes/extract_keywords.md) |
+| `clinical_note.py` | SQLite schema, review queue, history, CSV export | [docs/clinical_note.md](notes/clinical_note.md) |
+| `setup_models.py` | Pre-download script for models | [docs/setup_models.md](nlp/setup_models.md) |
+| `test_language_segmentation.py` | Pytest suite for detection, segmentation and routing | [docs/test_language_segmentation.md](test_cases/test_language_segmentation.md) |
 | `test_cases/` | Mixed pytest suites and manual model/benchmark scripts | [test_cases/README.md](test_cases/README.md) |
 | `test_audio/` | Reference transcripts for ASR accuracy (WER) tests | [test_audio/README.md](test_audio/README.md) |
 | `requirements.txt`, `.gitignore` | Dependencies; ignore rules (models, `*.wav`, local DB) | below |
