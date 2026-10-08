@@ -43,8 +43,8 @@ for _name in ("torch", "librosa", "transformers", "pydub"):
     _stub_if_missing(_name, MagicMock())
 _stub_if_missing("pydub.effects", MagicMock())
 
-import audio_language_detect as ald  # noqa: E402
-import transcribe as tr  # noqa: E402
+import nlp.audio_language_detect as ald  # noqa: E402
+import transcribe.transcribe as tr  # noqa: E402
 
 SR = 16000
 

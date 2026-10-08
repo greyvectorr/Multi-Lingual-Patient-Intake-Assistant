@@ -1,0 +1,317 @@
+"""
+Patient schema + clinical history tracking, with a review queue.
+
+Each patient has a unique ID; all intake visits are linked to that patient
+for traceable clinical history. Visits carry a status so the app can
+distinguish pending from reviewed.
+
+Fully offline / local-first: no cloud dependency.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import logging
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Final
+
+logger = logging.getLogger(__name__)
+
+# Local app-data folder — works the same regardless of OS
+DB_PATH: Final = Path(__file__).parent.parent / "data" / "notes.db"
+
+STATUS_PENDING: Final = "pending_review"
+STATUS_REVIEWED: Final = "reviewed"
+
+
+# ============================================================================
+# CONNECTION MANAGEMENT
+# ============================================================================
+
+@contextmanager
+def _get_connection():
+    """Yield a SQLite connection with row factory and foreign keys enabled."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+# ============================================================================
+# SCHEMA & MIGRATIONS
+# ============================================================================
+
+def init_db() -> None:
+    """Create tables if they don't exist, then run migration check."""
+    with _get_connection() as conn:
+        # Patients table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS patients (
+                patient_id TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Clinical visits table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS clinical_visits (
+                visit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                patient_id TEXT NOT NULL,
+                chief_complaint TEXT,
+                duration TEXT,
+                severity TEXT,
+                history TEXT,
+                patient_concerns TEXT,
+                language TEXT,
+                extracted_keywords TEXT,
+                raw_transcript TEXT,
+                status TEXT DEFAULT 'pending_review',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                reviewed_at TIMESTAMP,
+                FOREIGN KEY(patient_id) REFERENCES patients(patient_id)
+            )
+        """)
+
+        # Indexes for common query patterns
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_visits_patient ON clinical_visits(patient_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_visits_status ON clinical_visits(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_visits_created ON clinical_visits(created_at)")
+
+        conn.commit()
+
+    _migrate_schema()
+    logger.info("Database ready at: %s", DB_PATH)
+
+
+def _migrate_schema() -> None:
+    """Add feature columns required by the current application schema."""
+    REQUIRED_COLUMNS = {
+        "patient_concerns": "TEXT",
+        "status": "TEXT DEFAULT 'pending_review'",
+        "reviewed_at": "TIMESTAMP",
+        # Literal English translation of raw_transcript — distinct from the
+        # abstracted 5-field note. Needed for AI-transparency: showing the
+        # patient's original words alongside what was actually translated.
+        "translated_transcript": "TEXT",
+        "is_code_switched": "INTEGER DEFAULT 0",
+        "code_switch_languages": "TEXT",  # JSON-serialized list
+        # Per-field quoted evidence from translated_transcript, verified as
+        # real substrings before being stored — see structure_note.py's
+        # _verify_evidence(). JSON-serialized dict.
+        "note_evidence": "TEXT",
+    }
+
+    with _get_connection() as conn:
+        existing = {
+            row[1] for row in conn.execute("PRAGMA table_info(clinical_visits)").fetchall()
+        }
+
+        for col_name, col_type in REQUIRED_COLUMNS.items():
+            if col_name not in existing:
+                conn.execute(f"ALTER TABLE clinical_visits ADD COLUMN {col_name} {col_type}")
+                logger.info("Migration: added column '%s' to clinical_visits", col_name)
+
+        conn.commit()
+
+
+# ============================================================================
+# CRUD OPERATIONS
+# ============================================================================
+
+def save_patient_record(
+    patient_id: str,
+    chief_complaint: str,
+    duration: str,
+    severity: str,
+    history: str,
+    patient_concerns: str,
+    language: str,
+    keywords: dict,
+    transcript: str,
+    translated_transcript: str = "",
+    is_code_switched: bool = False,
+    code_switch_languages: list | None = None,
+    evidence: dict | None = None,
+) -> int:
+    """
+    Save a clinical visit. New visits always start as 'pending_review'.
+    Uses a single transaction for patient insert + visit insert.
+
+    translated_transcript / is_code_switched / code_switch_languages /
+    evidence default to empty/False/None so existing call sites that predate
+    these fields keep working unchanged.
+    """
+    with _get_connection() as conn:
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO patients (patient_id) VALUES (?)",
+                (patient_id,),
+            )
+            conn.execute(
+                """INSERT INTO clinical_visits
+                   (patient_id, chief_complaint, duration, severity, history,
+                    patient_concerns, language, extracted_keywords,
+                    raw_transcript, translated_transcript, is_code_switched,
+                    code_switch_languages, note_evidence, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    patient_id, chief_complaint, duration, severity, history,
+                    patient_concerns, language, json.dumps(keywords),
+                    transcript, translated_transcript, int(is_code_switched),
+                    json.dumps(code_switch_languages or []),
+                    json.dumps(evidence or {}), STATUS_PENDING,
+                ),
+            )
+            conn.commit()
+            visit_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            return visit_id
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def update_visit_and_mark_reviewed(
+    visit_id: int,
+    chief_complaint: str,
+    duration: str,
+    severity: str,
+    history: str,
+    patient_concerns: str,
+) -> None:
+    """Doctor-side save: applies edits and marks visit as reviewed."""
+    with _get_connection() as conn:
+        conn.execute(
+            """UPDATE clinical_visits
+               SET chief_complaint = ?, duration = ?, severity = ?, history = ?,
+                   patient_concerns = ?, status = ?, reviewed_at = ?
+               WHERE visit_id = ?""",
+            (
+                chief_complaint, duration, severity, history,
+                patient_concerns, STATUS_REVIEWED,
+                datetime.now().isoformat(), visit_id,
+            ),
+        )
+        conn.commit()
+
+
+def get_patient_history(patient_id: str) -> list[sqlite3.Row]:
+    """Retrieve full clinical history for a patient, most recent first."""
+    with _get_connection() as conn:
+        cursor = conn.execute(
+            """SELECT visit_id, chief_complaint, duration, severity, history,
+                      patient_concerns, language, status, created_at
+               FROM clinical_visits
+               WHERE patient_id = ?
+               ORDER BY created_at DESC, visit_id DESC""",
+            (patient_id,),
+        )
+        return cursor.fetchall()
+
+
+def get_pending_visits() -> list[sqlite3.Row]:
+    """Return all visits awaiting doctor review, oldest first."""
+    with _get_connection() as conn:
+        cursor = conn.execute(
+            """SELECT visit_id, patient_id, chief_complaint, language, created_at
+               FROM clinical_visits
+               WHERE status = ?
+               ORDER BY created_at ASC, visit_id ASC""",
+            (STATUS_PENDING,),
+        )
+        return cursor.fetchall()
+
+
+def get_visit_by_id(visit_id: int) -> sqlite3.Row | None:
+    """Fetch a single visit's full detail."""
+    with _get_connection() as conn:
+        cursor = conn.execute(
+            """SELECT visit_id, patient_id, chief_complaint, duration, severity,
+                      history, patient_concerns, language,
+                      extracted_keywords, raw_transcript, translated_transcript,
+                      is_code_switched, code_switch_languages, note_evidence,
+                      status, created_at, reviewed_at
+               FROM clinical_visits
+               WHERE visit_id = ?""",
+            (visit_id,),
+        )
+        return cursor.fetchone()
+
+
+def get_dashboard_stats() -> dict[str, int]:
+    """Counts for the Dashboard stat cards — single query."""
+    with _get_connection() as conn:
+        row = conn.execute(
+            """SELECT
+                (SELECT COUNT(*) FROM patients) AS total_patients,
+                (SELECT COUNT(*) FROM clinical_visits) AS total_visits,
+                (SELECT COUNT(*) FROM clinical_visits WHERE status = ?) AS pending_review
+            """,
+            (STATUS_PENDING,),
+        ).fetchone()
+        return {
+            "total_patients": row["total_patients"],
+            "total_visits": row["total_visits"],
+            "pending_review": row["pending_review"],
+        }
+
+
+# ============================================================================
+# EXPORTS
+# ============================================================================
+
+def export_all_records_to_csv(output_path: str = "patient_records_export.csv") -> tuple[str, int]:
+    """Export the entire clinical_visits table to CSV."""
+    with _get_connection() as conn:
+        cursor = conn.execute("""
+            SELECT visit_id, patient_id, chief_complaint, duration, severity,
+                   history, patient_concerns, language,
+                   extracted_keywords, raw_transcript, translated_transcript,
+                   is_code_switched, code_switch_languages, note_evidence,
+                   status, created_at, reviewed_at
+            FROM clinical_visits
+            ORDER BY patient_id, created_at DESC, visit_id DESC
+        """)
+
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([d[0] for d in cursor.description])
+            writer.writerows(cursor)
+
+        # Re-count rows without loading everything into memory
+        count = conn.execute("SELECT COUNT(*) FROM clinical_visits").fetchone()[0]
+
+    return output_path, count
+
+
+def export_single_visit_to_csv(visit_id: int, output_path: str | None = None) -> str:
+    """Export one visit as CSV."""
+    row = get_visit_by_id(visit_id)
+    if not row:
+        raise ValueError(f"No visit found with visit_id={visit_id}")
+
+    column_names = [
+        "visit_id", "patient_id", "chief_complaint", "duration", "severity",
+        "history", "patient_concerns", "language",
+        "extracted_keywords", "raw_transcript", "translated_transcript",
+        "is_code_switched", "code_switch_languages", "note_evidence",
+        "status", "created_at",
+    ]
+
+    if output_path is None:
+        output_path = f"visit_{visit_id}_export.csv"
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(column_names)
+        writer.writerow(tuple(row))
+
+    return output_path
+
