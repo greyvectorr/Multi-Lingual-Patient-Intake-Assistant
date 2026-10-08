@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
-from structure_note import (
+from notes.structure_note import (
     _extract_json_from_text,
     _validate_structure,
     _parse_llm_output,
@@ -216,7 +216,7 @@ class TestBatchProcessing:
             })
         monkeypatch.setattr("structure_note.generate_text", mock_generate)
 
-        from structure_note import structure_note_batch
+        from notes.structure_note import structure_note_batch
         results = structure_note_batch([
             ("transcript 1", "Hausa"),
             ("transcript 2", "Yoruba"),

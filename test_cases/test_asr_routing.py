@@ -7,7 +7,7 @@ and no real patient audio is processed.
 
 import os
 
-import transcribe
+import transcribe.transcribe as transcribe
 
 
 def fake_language_pipeline(language):

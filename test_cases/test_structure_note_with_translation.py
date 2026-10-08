@@ -1,7 +1,7 @@
 import json
 import time
 
-from structure_note import structure_note, translate_transcript
+from notes.structure_note import structure_note, translate_transcript
 
 
 TRANSCRIPT = (

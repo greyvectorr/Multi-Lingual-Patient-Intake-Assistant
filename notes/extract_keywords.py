@@ -18,9 +18,9 @@ import re
 from typing import Final
 
 try:
-    from structure_note import generate_text  # app.py's style: nlp/ added to sys.path directly
+    from notes.structure_note import generate_text  # app.py's style: nlp/ added to sys.path directly
 except ImportError:
-    from structure_note import generate_text  # proper package import (tests, external callers)
+    from notes.structure_note import generate_text  # proper package import (tests, external callers)
 
 logger = logging.getLogger(__name__)
 

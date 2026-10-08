@@ -49,7 +49,7 @@ import gradio as gr
 # should be able to start while the local GGUF backend is being configured.
 _BASE = Path(__file__).resolve().parent
 
-import clinical_note as db  # noqa: E402
+import notes.clinical_note as db  # noqa: E402
 
 # ── logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -587,7 +587,7 @@ def _to_detection_result(result: dict[str, Any]) -> DetectionResult:
 def _detect_language_safe(audio_path: str) -> DetectionResult:
     """Run language detection; on any exception return an unreliable result with the reason."""
     try:
-        from audio_language_detect import detect_audio_language
+        from nlp.audio_language_detect import detect_audio_language
         return _to_detection_result(detect_audio_language(audio_path))
     except Exception as e:
         logger.warning("Language detection failed: %s", e)
@@ -678,7 +678,7 @@ def _resolve_language_plan(
         return None
 
     try:
-        from audio_language_detect import build_plan_for_selected_languages
+        from nlp.audio_language_detect import build_plan_for_selected_languages
         info = build_plan_for_selected_languages(audio_path, selected)
         return IntakeLanguagePlan(
             languages=list(info["languages"]),
@@ -725,9 +725,9 @@ def process_intake(
         return _intake_error("✗ Please provide patient audio before processing.")
 
     try:
-        from transcribe import transcribe_audio, transcribe_segments  # 🛠🛠🛠 CHANGED: transcribe_segments added
-        from structure_note import structure_note, translate_transcript
-        from extract_keywords import extract_keywords
+        from transcribe.transcribe import transcribe_audio, transcribe_segments  # 🛠🛠🛠 CHANGED: transcribe_segments added
+        from notes.structure_note import structure_note, translate_transcript
+        from notes.extract_keywords import extract_keywords
 
         # 🛠🛠🛠 NEW: if the detection event hasn't landed yet (nurse clicked very quickly), run it now instead of failing.
         if detection_result is None:

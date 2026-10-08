@@ -5,7 +5,7 @@ Temporary integration test for the local GGUF inference layer.
 Uses fictional clinical information only.
 """
 
-from structure_note import structure_note
+from notes.structure_note import structure_note
 
 
 # A fictional consultation transcript for testing.

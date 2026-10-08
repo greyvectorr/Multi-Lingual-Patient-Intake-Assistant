@@ -21,7 +21,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from structure_note import _extract_json_from_text, _validate_structure, _parse_llm_output
+from notes.structure_note import _extract_json_from_text, _validate_structure, _parse_llm_output
 
 
 # ============================================================================
@@ -30,7 +30,7 @@ from structure_note import _extract_json_from_text, _validate_structure, _parse_
 
 @pytest.fixture
 def temp_db(tmp_path, monkeypatch):
-    import clinical_note as clinical_note
+    import notes.clinical_note as clinical_note
     test_db_path = tmp_path / "test_notes.db"
     monkeypatch.setattr(clinical_note, "DB_PATH", test_db_path)
     clinical_note.init_db()
@@ -65,7 +65,7 @@ def mock_generate():
 class TestExtractKeywords:
     def test_extract_keywords_basic(self, mock_generate):
         with patch("extract_keywords.generate_text", mock_generate):
-            from extract_keywords import extract_keywords
+            from notes.extract_keywords import extract_keywords
             result = extract_keywords("Patient has fever and headache for 2 days")
 
         assert "fever" in result["symptoms"]
@@ -76,19 +76,19 @@ class TestExtractKeywords:
 
     def test_extract_keywords_empty_text(self):
         with patch("extract_keywords.generate_text", return_value=""):
-            from extract_keywords import extract_keywords
+            from notes.extract_keywords import extract_keywords
             result = extract_keywords("")
         assert result == {"symptoms": [], "duration": [], "severity": [], "anatomical_sites": []}
 
     def test_extract_keywords_no_json_fallback(self):
         with patch("extract_keywords.generate_text", return_value="not json"):
-            from extract_keywords import extract_keywords
+            from notes.extract_keywords import extract_keywords
             result = extract_keywords("some text")
         assert all(v == [] for v in result.values())
 
     def test_extract_keywords_llm_unavailable(self):
         with patch("extract_keywords.generate_text", side_effect=RuntimeError("no model")):
-            from extract_keywords import extract_keywords
+            from notes.extract_keywords import extract_keywords
             result = extract_keywords("some text")
         assert all(v == [] for v in result.values())
 
@@ -99,7 +99,7 @@ class TestExtractKeywords:
                 "duration": [], "severity": [], "anatomical_sites": [],
             })
         with patch("extract_keywords.generate_text", mock_gen):
-            from extract_keywords import extract_keywords
+            from notes.extract_keywords import extract_keywords
             result = extract_keywords("text")
         assert result["symptoms"] == ["fever", "headache"]
 
@@ -321,7 +321,7 @@ class TestKeywordExtractionOnEnglishNote:
     def test_keyword_extraction_runs_on_english_note(self, mock_generate):
         english_note = "Chief complaint: severe abdominal pain since yesterday with vomiting"
         with patch("extract_keywords.generate_text", mock_generate):
-            from extract_keywords import extract_keywords
+            from notes.extract_keywords import extract_keywords
             result = extract_keywords(english_note)
         assert len(result["symptoms"]) > 0
         assert "severe" in result["severity"]

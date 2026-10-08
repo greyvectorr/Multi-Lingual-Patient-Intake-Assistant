@@ -118,7 +118,7 @@ Whisper (language ID) and the NCAIR/OpenAI ASR models download automatically the
 | `MEDIVOICE_INDIGENOUS_PRIOR` | env var | `1.0` (off) | Multiplier on Hausa/Yoruba probabilities to counter Whisper's English bias. Tune only after reading the logged raw top-3 scores |
 | `HF_TOKEN` | env var | – | Hugging Face token for gated downloads |
 | `LOCAL_MODEL_PATH`, `N_CTX`, `N_THREADS`, `N_BATCH` | `structure_note.py` | `models/gguf/AMINI-q4_k_m.gguf`, 2048, 2, 256 | LLM file and CPU settings |
-| Detection thresholds | `audio_language_detect.py` | see [its doc](docs/audio_language_detect.md) | Confidence, chunk length, minimum language duration, etc. |
+| Detection thresholds | `audio_language_detect.py` | see [its doc](nlp/audio_language_detect.md) | Confidence, chunk length, minimum language duration, etc. |
 | `DB_PATH` | `clinical_note.py` | `<repo parent>/data/notes.db` | Where the SQLite file is written (see Known issues) |
 
 ## Data and privacy
